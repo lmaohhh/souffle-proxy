@@ -1,0 +1,73 @@
+{
+  "default": "glm-5.3",
+  "presets": {
+    "glm-5.3": {
+      "name": "glm-5.3",
+      "model": "z-ai/glm-5.3",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "brotli": true,
+      "inject": {
+        "thinking": { "type": "enabled", "clear_thinking": false },
+        "reasoning_effort": "max"
+      }
+    },
+    "kimi-k3": {
+      "name": "kimi-k3",
+      "model": "moonshotai/kimi-k3",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "inject": {
+        "reasoning_effort": "max"
+      },
+      "degen_repeat": true,
+      "prepend_messages": [
+        {
+          "role": "system",
+          "content": "You are an analytical assistant. Always begin your internal reasoning with complete natural language sentences."
+        }
+      ]
+    },
+    "gpt-6-astra": {
+      "name": "gpt-6-astra",
+      "model": "gpt-6-astra",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "inject": {
+        "reasoning_effort": "max"
+      }
+    },
+    "gpt-6.1-sol": {
+      "name": "gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "inject": {
+        "reasoning_effort": "max"
+      }
+    },
+    "glm-5.3-flash": {
+      "name": "glm-5.3-flash",
+      "model": "z-ai/glm-5.3-flash",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "inject": {
+        "thinking": { "type": "enabled", "clear_thinking": false },
+        "reasoning_effort": "max"
+      }
+    },
+    "glm-5.3-h3": {
+      "name": "glm-5.3-h3",
+      "model": "z-ai/glm-5.3",
+      "key_env": "SOUFFLE_API_KEY",
+      "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "http3": true,
+      "brotli": true,
+      "souffle_pout": true,
+      "inject": {
+        "thinking": { "type": "enabled", "clear_thinking": false },
+        "reasoning_effort": "max"
+      }
+    }
+  }
+}

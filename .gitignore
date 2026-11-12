@@ -1,0 +1,9 @@
+/target
+# Runtime config + secrets live beside the exe and must never be committed.
+# The committed template is config.json.example.
+config.json
+.env
+docs/
+.agents/
+tests/
+TEST_*.md
