@@ -3340,6 +3340,20 @@ async fn dispatch_upstream(
                                         &format!("Upstream GOAWAY error_code={}", error_code),
                                     );
                                 }
+                                other if is_terminal_upstream_error(&other) => {
+                                    // Terminal: the same request is too large for the peer on
+                                    // any connection. Retrying (and evicting the pool each
+                                    // time) cannot succeed, so surface it immediately.
+                                    log(
+                                        &format!("Upstream request rejected: {}", other),
+                                        Some(&req_id),
+                                    );
+                                    state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                                    return make_text_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("Upstream error: {}", other),
+                                    );
+                                }
                                 other => {
                                     log(
                                         &format!("Upstream error on first chunk: {}", other),
@@ -3768,6 +3782,15 @@ async fn dispatch_upstream(
                             &format!("Upstream GOAWAY error_code={}", error_code),
                         );
                     }
+                    other if is_terminal_upstream_error(&other) => {
+                        // Same terminal rule as the first-chunk arm: no retry, no eviction.
+                        log(&format!("Upstream request rejected: {}", other), Some(&req_id));
+                        state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        return make_text_response(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("Upstream error: {}", other),
+                        );
+                    }
                     other => {
                         log(&format!("Network error: {}", other), Some(&req_id));
                         if let Some(cid) = failed_conn_id {
@@ -3946,6 +3969,13 @@ impl Drop for StreamDisconnectGuard {
             );
         }
     }
+}
+
+/// Failures that are terminal for this request: the identical bytes fail the same
+/// way on a fresh connection, so retrying only burns the retry budget and evicts a
+/// healthy pool entry on every attempt.
+fn is_terminal_upstream_error(e: &UpstreamError) -> bool {
+    matches!(e, UpstreamError::HeaderTooBig { .. })
 }
 
 fn log_midstream_upstream_error(e: UpstreamError, req_id: &str) -> &'static str {
@@ -7481,6 +7511,46 @@ mod tests {
             classify_retry(&err_dirty_goaway, 0, MAX_RETRY, 0, MAX_FREE),
             RetryAction::TerminalError(502)
         );
+    }
+
+    #[test]
+    fn test_header_too_big_dispatch_is_terminal() {
+        // HeaderTooBig is permanent for this request: dispatch must answer 502 at
+        // once instead of retrying up to max_retry and evicting the pooled
+        // connection on every attempt.
+        let e = UpstreamError::HeaderTooBig {
+            actual_size: 65_536,
+            max_size: 16_384,
+        };
+        assert!(
+            is_terminal_upstream_error(&e),
+            "HeaderTooBig must be dispatched on the terminal arm"
+        );
+        // ...and it must not take either invalidation path on the way out.
+        assert!(
+            !e.is_stream_scoped(),
+            "HeaderTooBig must not evict a single stream"
+        );
+        assert!(
+            !e.is_connection_closing(),
+            "HeaderTooBig must not evict the pooled connection"
+        );
+
+        // Failures that stay retryable must not be swallowed by the terminal arm.
+        for e in [
+            UpstreamError::H2StreamReset { error_code: 0x0102 },
+            UpstreamError::H3StreamReset { error_code: 0x0102 },
+            UpstreamError::H2GoAway { error_code: 0 },
+            UpstreamError::H3GoAway { error_code: 0x0100 },
+            UpstreamError::Connect(std::io::Error::other("dial")),
+            UpstreamError::Timeout,
+            UpstreamError::Other("boom".into()),
+        ] {
+            assert!(
+                !is_terminal_upstream_error(&e),
+                "{e} must keep its existing retry behaviour"
+            );
+        }
     }
 
     #[test]
