@@ -7397,6 +7397,12 @@ mod tests {
 
         let captured = bodies.lock().unwrap();
         assert_eq!(captured.len(), 3, "each attempt must send a body");
+        // The real serialized body (spliced messages included) must be patchable,
+        // otherwise dispatch would quietly fall back to a full re-serialize.
+        assert!(matches!(
+            patch_serialized_model(&Bytes::copy_from_slice(&captured[0]), "\"model-b\""),
+            ModelPatch::Replaced(_)
+        ));
         for (idx, model) in ["model-a", "model-b", "z-ai/model-c-long"]
             .iter()
             .enumerate()
