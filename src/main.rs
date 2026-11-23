@@ -2356,6 +2356,21 @@ fn for_each_array_element(s: &str, mut f: impl FnMut(usize, usize)) -> Option<()
     }
 }
 
+/// Member key with quotes stripped and escapes resolved. `Borrowed` when the key
+/// has no escapes (the common case), so the scanner stays allocation-free.
+fn decode_member_key(key: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if key.len() < 2 || !key.starts_with('"') || !key.ends_with('"') {
+        return None;
+    }
+    let body = &key[1..key.len() - 1];
+    if !body.contains('\\') {
+        return Some(std::borrow::Cow::Borrowed(body));
+    }
+    serde_json::from_str::<String>(key)
+        .ok()
+        .map(std::borrow::Cow::Owned)
+}
+
 fn scan_message_spans(s: &str) -> Option<MsgFieldSpans> {
     let mut spans = MsgFieldSpans {
         role: None,
@@ -2364,17 +2379,31 @@ fn scan_message_spans(s: &str) -> Option<MsgFieldSpans> {
         reasoning: None,
         obj_close: 0,
     };
-    // Duplicate keys: last one wins, matching serde's map semantics.
+    // Keys are compared in their DECODED form: "\u0063ontent" is the same member as
+    // "content", and missing it would append a second content member while the
+    // client's text (and any media) stayed under the escaped one.
+    let mut duplicate = false;
     let obj_close = for_each_object_member(s, |key, vs, ve| {
-        let slot = match key {
-            "\"role\"" => &mut spans.role,
-            "\"content\"" => &mut spans.content,
-            "\"reasoning_content\"" => &mut spans.reasoning_content,
-            "\"reasoning\"" => &mut spans.reasoning,
+        let Some(decoded) = decode_member_key(key) else {
+            return;
+        };
+        let slot = match decoded.as_ref() {
+            "role" => &mut spans.role,
+            "content" => &mut spans.content,
+            "reasoning_content" => &mut spans.reasoning_content,
+            "reasoning" => &mut spans.reasoning,
             _ => return,
         };
+        // Repeated key: rewriting only one occurrence would leave a duplicate that
+        // still wins (or loses) on the far side. Leave the element untouched instead.
+        if slot.is_some() {
+            duplicate = true;
+        }
         *slot = Some((vs, ve));
     })?;
+    if duplicate {
+        return None;
+    }
     spans.obj_close = obj_close;
     Some(spans)
 }
@@ -7017,6 +7046,33 @@ mod tests {
     }
 
     #[test]
+    fn test_souffle_pout_escaped_member_keys_are_recognized() {
+        // "\u0063ontent" / "\u0072ole" are the same members as content/role. Missing
+        // them used to append a second content member and drop the client's text.
+        let raw = r#"[{"\u0072ole":"assistant","\u0063ontent":"hello","reasoning_content":"r"}]"#;
+        let folded = fold_in_content_cot(raw).expect("escaped keys must still fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        let text = parsed[0]["content"].as_str().expect("folded content is a string");
+        assert!(text.contains("hello"), "client text lost: {text}");
+        assert_eq!(parsed[0]["reasoning_content"], "");
+        // Exactly one content member: the scanner rejects any element with a repeated
+        // key, so a Some() here proves no duplicate was appended.
+        let folded_arr = folded.get();
+        let elem = &folded_arr[1..folded_arr.len() - 1];
+        let spans = scan_message_spans(elem).expect("folded element must not contain duplicate keys");
+        assert!(spans.content.is_some(), "content span missing after fold");
+    }
+
+    #[test]
+    fn test_souffle_pout_duplicate_keys_leave_element_untouched() {
+        let raw = r#"[{"role":"assistant","content":"a","content":"b","reasoning_content":"r"}]"#;
+        assert!(
+            fold_in_content_cot(raw).is_none(),
+            "a repeated member key must skip folding instead of leaving a duplicate"
+        );
+    }
+
+    #[test]
     fn test_souffle_pout_unicode_whitespace_is_trimmed() {
         // Parity with the pre-splice code: content is start-trimmed with str::trim_start
         // (Unicode-aware), so leading NBSP disappears while trailing bytes are kept.
@@ -7659,6 +7715,9 @@ mod tests {
             max_free_retries: u32,
         ) -> RetryAction {
             match err {
+                // Permanent for this request (oversized header block): answer now,
+                // never retry, never evict a connection that is healthy.
+                UpstreamError::HeaderTooBig { .. } => RetryAction::TerminalError(502),
                 UpstreamError::H2StreamReset { error_code: 7 }
                 | UpstreamError::H3StreamReset { error_code: 0x010b } => {
                     if free_retries < max_free_retries {
