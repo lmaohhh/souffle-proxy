@@ -3345,7 +3345,14 @@ async fn dispatch_upstream(
                                         &format!("Upstream error on first chunk: {}", other),
                                         Some(&req_id),
                                     );
-                                    preset.client.invalidate_if_same(conn_id).await;
+                                    // Only a connection-level fault may evict the pool: for H3
+                                    // that call closes the QUIC connection and aborts every
+                                    // concurrent response riding it.
+                                    if stream_scoped {
+                                        preset.client.invalidate_stream_if_same(conn_id).await;
+                                    } else {
+                                        preset.client.invalidate_if_same(conn_id).await;
+                                    }
                                     if attempt < preset.config.max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt);
@@ -3764,7 +3771,13 @@ async fn dispatch_upstream(
                     other => {
                         log(&format!("Network error: {}", other), Some(&req_id));
                         if let Some(cid) = failed_conn_id {
-                            preset.client.invalidate_if_same(cid).await;
+                            // Same rule as the first-chunk catch-all: a stream-scoped
+                            // failure must not tear down the shared connection.
+                            if stream_scoped {
+                                preset.client.invalidate_stream_if_same(cid).await;
+                            } else {
+                                preset.client.invalidate_if_same(cid).await;
+                            }
                         }
                         if attempt < preset.config.max_retry - 1 {
                             let delay = retry_delay(attempt);
