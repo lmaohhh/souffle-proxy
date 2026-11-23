@@ -2015,178 +2015,494 @@ fn splice_messages_raw(
 /// Folds `reasoning_content` (or `reasoning`) into `content` as `<think>\n...\n</think>\n\n`
 /// for assistant messages, while preserving user messages, non-assistant turns, and multi-modal text parts.
 /// Returns Some(Box<RawValue>) if folded, or None if no folding occurred.
+///
+/// Byte-level splice: member spans are located by a quote/escape-aware scanner and
+/// only the folded values are rewritten, so a 20-turn agent conversation no longer
+/// pays 20 `serde_json::Map` parse -> mutate -> serialize round-trips.
 fn fold_in_content_cot(msgs_raw: &str) -> Option<Box<RawValue>> {
     // 1. O(1) byte pre-scan: return None immediately if neither key exists
     if !msgs_raw.contains("\"reasoning_content\"") && !msgs_raw.contains("\"reasoning\"") {
         return None;
     }
 
-    // 2. Borrow message elements as RawValue slices; only deserialize matching elements
-    let mut raw_msgs: Vec<Box<RawValue>> = serde_json::from_str(msgs_raw).ok()?;
+    // 2. Borrow message elements as RawValue slices; only scan matching elements
+    let raw_msgs: Vec<Box<RawValue>> = serde_json::from_str(msgs_raw).ok()?;
     let mut modified = false;
 
-    // 3. Per-element filter + assistant role fold
-    for slot in &mut raw_msgs {
-        let elem_str = slot.get();
-        if !elem_str.contains("assistant")
-            || (!elem_str.contains("\"reasoning_content\"") && !elem_str.contains("\"reasoning\""))
-        {
-            continue;
+    // 3. Rebuild the array once: folded elements are spliced, the rest copied verbatim
+    let mut out = String::with_capacity(msgs_raw.len() + 1024);
+    out.push('[');
+    for (i, slot) in raw_msgs.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
         }
-
-        let Ok(mut msg) = serde_json::from_str::<serde_json::Map<String, Value>>(elem_str) else {
-            continue;
-        };
-
-        let is_assistant = msg
-            .get("role")
-            .and_then(Value::as_str)
-            .map(|r| r == "assistant")
-            .unwrap_or(false);
-
-        if !is_assistant {
-            continue;
-        }
-
-        // Extract non-empty reasoning content, preferring "reasoning_content", then "reasoning"
-        let rc_opt = msg
-            .get("reasoning_content")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                msg.get("reasoning")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-            });
-
-        let rc = match rc_opt {
-            Some(s) => s,
-            None => continue,
-        };
-
-        // 4. Inner Tag Strip Guard: strip redundant outer <think> / </think> tags inside reasoning_content
-        let mut rc_clean = rc.trim();
-        if let Some(s) = rc_clean.strip_prefix("<think>") {
-            rc_clean = s.trim_start();
-        }
-        if let Some(s) = rc_clean.strip_suffix("</think>") {
-            rc_clean = s.trim_end();
-        }
-        let rc_clean = rc_clean.trim();
-
-        if rc_clean.is_empty() {
-            continue;
-        }
-
-        // 5. Inspect content & Idempotency guard
-        let new_content = match msg.get("content") {
-            Some(Value::String(s)) => {
-                let s_trimmed = s.trim_start();
-                if s_trimmed.starts_with("<think>") {
-                    // Content already starts with <think>, skip folding
-                    continue;
-                }
-                if s.trim().is_empty() {
-                    format!("<think>\n{}\n</think>", rc_clean)
-                } else {
-                    format!("<think>\n{}\n</think>\n\n{}", rc_clean, s_trimmed)
-                }
+        match fold_one_message(slot.get()) {
+            Some(elem) => {
+                out.push_str(&elem);
+                modified = true;
             }
-            Some(Value::Array(arr)) => {
-                // 6. Multi-modal / array content preservation: safely concatenate text parts
-                let mut text_parts = String::new();
-                for part in arr {
-                    if let Some(s) = part.as_str() {
-                        text_parts.push_str(s);
-                    } else if let Some(obj) = part.as_object() {
-                        if let Some(text) = obj.get("text").and_then(Value::as_str) {
-                            text_parts.push_str(text);
-                        }
-                    }
-                }
-                let text_trimmed = text_parts.trim_start();
-                if text_trimmed.starts_with("<think>") {
-                    // Already starts with <think>, skip folding
-                    continue;
-                }
-                if text_parts.trim().is_empty() {
-                    format!("<think>\n{}\n</think>", rc_clean)
-                } else {
-                    format!("<think>\n{}\n</think>\n\n{}", rc_clean, text_trimmed)
-                }
-            }
-            Some(Value::Null) | None => {
-                // Null or absent content (e.g. tool call turns)
-                format!("<think>\n{}\n</think>", rc_clean)
-            }
-            Some(other) => {
-                let s = other.to_string();
-                let s_trimmed = s.trim_start();
-                if s_trimmed.starts_with("<think>") {
-                    continue;
-                }
-                format!("<think>\n{}\n</think>\n\n{}", rc_clean, s_trimmed)
-            }
-        };
-
-        // Rebuild structured content instead of flattening it: folding must not drop
-        // non-text parts (image_url, input_audio, ...). Text parts are already inside
-        // new_content; everything else is carried over verbatim.
-        let existing_array = msg.get("content").and_then(Value::as_array).cloned();
-        match existing_array {
-            Some(arr) => {
-                let mut media: Vec<Value> = Vec::new();
-                for part in arr {
-                    let is_text = part.is_string() || part.get("text").is_some();
-                    if !is_text {
-                        media.push(part);
-                    }
-                }
-                let mut parts = vec![json!({"type": "text", "text": new_content})];
-                parts.append(&mut media);
-                msg.insert("content".to_string(), Value::Array(parts));
-            }
-            None => {
-                msg.insert("content".to_string(), Value::String(new_content));
-            }
+            None => out.push_str(slot.get()),
         }
-
-        // 7. Schema normalization: set "reasoning_content": "" (and "reasoning": "" if present)
-        // Normalize only keys the message actually carried: injecting an empty
-        // reasoning_content into a message that never had one can trip strict
-        // OpenAI-compatible schema validators.
-        if msg.contains_key("reasoning_content") {
-            msg.insert(
-                "reasoning_content".to_string(),
-                Value::String(String::new()),
-            );
-        }
-        if msg.contains_key("reasoning") {
-            msg.insert("reasoning".to_string(), Value::String(String::new()));
-        }
-
-        let updated = serde_json::to_string(&msg).ok()?;
-        *slot = RawValue::from_string(updated).ok()?;
-        modified = true;
     }
+    out.push(']');
 
     if !modified {
         return None;
     }
 
-    let total_len: usize = raw_msgs.iter().map(|s| s.get().len() + 1).sum::<usize>() + 2;
-    let mut out = String::with_capacity(total_len);
-    out.push('[');
-    for (i, raw) in raw_msgs.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+    RawValue::from_string(out).ok()
+}
+
+const FOLD_THINK_OPEN: &str = "<think>";
+const FOLD_THINK_CLOSE: &str = "</think>";
+
+/// Byte spans of the members folding cares about, plus the object's closing brace.
+struct MsgFieldSpans {
+    role: Option<(usize, usize)>,
+    content: Option<(usize, usize)>,
+    reasoning_content: Option<(usize, usize)>,
+    reasoning: Option<(usize, usize)>,
+    obj_close: usize,
+}
+
+/// Returns the index just past the closing quote of the JSON string at `i`.
+/// SIMD `memchr2` skips string bodies at memory bandwidth, same trick as `scan_json_array`.
+fn scan_json_string_end(bytes: &[u8], i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    let mut i = i + 1;
+    while i < bytes.len() {
+        let hit = i + memchr::memchr2(b'"', b'\\', &bytes[i..])?;
+        if bytes[hit] == b'"' {
+            return Some(hit + 1);
         }
-        out.push_str(raw.get());
+        // Escapes are never truncated inside a well-formed string.
+        i = hit + 2;
+    }
+    None
+}
+
+/// Returns the index just past the JSON value starting at `i`.
+fn scan_json_value_end(bytes: &[u8], i: usize) -> Option<usize> {
+    match *bytes.get(i)? {
+        b'"' => scan_json_string_end(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 0u32;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => {
+                        j = scan_json_string_end(bytes, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.checked_sub(1)?;
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            // Number / true / false / null: ends at the next structural delimiter.
+            let mut j = i;
+            while j < bytes.len()
+                && !matches!(bytes[j], b',' | b'}' | b']')
+                && !bytes[j].is_ascii_whitespace()
+            {
+                j += 1;
+            }
+            (j > i).then_some(j)
+        }
+    }
+}
+
+/// Walks the top-level members of a JSON object, handing each key (quotes included)
+/// and its value span to `f`. Returns the index of the closing brace.
+fn for_each_object_member(s: &str, mut f: impl FnMut(&str, usize, usize)) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match *bytes.get(i)? {
+            b'}' => return Some(i),
+            b'"' => {}
+            _ => return None,
+        }
+        let key_start = i;
+        let key_end = scan_json_string_end(bytes, i)?;
+        i = key_end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let value_end = scan_json_value_end(bytes, i)?;
+        f(s.get(key_start..key_end)?, i, value_end);
+        i = value_end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match *bytes.get(i)? {
+            b',' => i += 1,
+            b'}' => return Some(i),
+            _ => return None,
+        }
+    }
+}
+
+/// Walks the top-level elements of a JSON array, handing each element span to `f`.
+fn for_each_array_element(s: &str, mut f: impl FnMut(usize, usize)) -> Option<()> {
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'[') {
+        return None;
+    }
+    i += 1;
+    loop {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if *bytes.get(i)? == b']' {
+            return Some(());
+        }
+        let end = scan_json_value_end(bytes, i)?;
+        f(i, end);
+        i = end;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        match *bytes.get(i)? {
+            b',' => i += 1,
+            b']' => return Some(()),
+            _ => return None,
+        }
+    }
+}
+
+fn scan_message_spans(s: &str) -> Option<MsgFieldSpans> {
+    let mut spans = MsgFieldSpans {
+        role: None,
+        content: None,
+        reasoning_content: None,
+        reasoning: None,
+        obj_close: 0,
+    };
+    // Duplicate keys: last one wins, matching serde's map semantics.
+    let obj_close = for_each_object_member(s, |key, vs, ve| {
+        let slot = match key {
+            "\"role\"" => &mut spans.role,
+            "\"content\"" => &mut spans.content,
+            "\"reasoning_content\"" => &mut spans.reasoning_content,
+            "\"reasoning\"" => &mut spans.reasoning,
+            _ => return,
+        };
+        *slot = Some((vs, ve));
+    })?;
+    spans.obj_close = obj_close;
+    Some(spans)
+}
+
+/// Byte length of the whitespace token at the head of `b`, or 0 if it is not
+/// whitespace. Escape-aware so raw string bodies can be trimmed without decoding.
+fn raw_ws_token_len(b: &[u8]) -> usize {
+    match b.first() {
+        Some(b' ') | Some(b'\t') | Some(b'\n') | Some(b'\r') => 1,
+        Some(b'\\') => match b.get(1) {
+            Some(b'n') | Some(b't') | Some(b'r') => 2,
+            Some(b'u') if b.len() >= 6 => {
+                let mut code = 0u32;
+                let mut valid = true;
+                for &c in &b[2..6] {
+                    match (c as char).to_digit(16) {
+                        Some(d) => code = code * 16 + d,
+                        None => {
+                            valid = false;
+                            break;
+                        }
+                    }
+                }
+                if valid && matches!(code, 0x20 | 0x09 | 0x0a | 0x0d | 0x0c | 0x0b) {
+                    6
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        },
+        _ => 0,
+    }
+}
+
+/// Equivalent of `str::trim_start` over raw JSON string content (escapes preserved).
+fn raw_trim_start(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let n = raw_ws_token_len(&b[i..]);
+        if n == 0 {
+            break;
+        }
+        i += n;
+    }
+    &s[i..]
+}
+
+/// Equivalent of `str::trim_end` over raw JSON string content (escapes preserved).
+fn raw_trim_end(s: &str) -> &str {
+    let b = s.as_bytes();
+    let mut i = 0;
+    let mut end = 0;
+    while i < b.len() {
+        let n = raw_ws_token_len(&b[i..]);
+        if n > 0 {
+            i += n;
+            continue;
+        }
+        let step = if b[i] == b'\\' {
+            let want = if b.get(i + 1) == Some(&b'u') { 6 } else { 2 };
+            want.min(b.len() - i)
+        } else {
+            1
+        };
+        i += step;
+        end = i;
+    }
+    &s[..end]
+}
+
+fn raw_trim(s: &str) -> &str {
+    raw_trim_end(raw_trim_start(s))
+}
+
+/// Inner bytes of a JSON string value (quotes stripped), or None for non-strings.
+fn raw_string_body(src: &str, span: Option<(usize, usize)>) -> Option<&str> {
+    let (vs, ve) = span?;
+    let raw = src.get(vs..ve)?;
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        Some(&raw[1..raw.len() - 1])
+    } else {
+        None
+    }
+}
+
+/// `<think>\n{rc}\n</think>` written as JSON string body (escapes stay escaped).
+fn push_think_block(out: &mut String, rc: &str) {
+    out.push_str(FOLD_THINK_OPEN);
+    out.push_str("\\n");
+    out.push_str(rc);
+    out.push_str("\\n");
+    out.push_str(FOLD_THINK_CLOSE);
+}
+
+fn quote_json_string(body: &str) -> String {
+    let mut s = String::with_capacity(body.len() + 2);
+    s.push('"');
+    s.push_str(body);
+    s.push('"');
+    s
+}
+
+/// Classifies an array content part: `Some(Some(body))` is a text part carrying
+/// string text, `Some(None)` a text part whose `text` is not a string, `None` a
+/// non-text part (image_url, input_audio, ...) that must be carried verbatim.
+fn part_text_body(part: &str) -> Option<Option<&str>> {
+    if part.len() >= 2 && part.starts_with('"') && part.ends_with('"') {
+        return Some(Some(&part[1..part.len() - 1]));
+    }
+    if !part.starts_with('{') {
+        return None;
+    }
+    let mut found = None;
+    for_each_object_member(part, |key, vs, ve| {
+        if key == "\"text\"" {
+            let raw = &part[vs..ve];
+            found = Some(
+                if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+                    Some(&raw[1..raw.len() - 1])
+                } else {
+                    None
+                },
+            );
+        }
+    })?;
+    found
+}
+
+/// Folds array content: text parts are concatenated raw and become the first text
+/// part; every non-text part is re-emitted verbatim so media is never dropped.
+fn fold_array_content(raw: &str, rc: &str) -> Option<String> {
+    let mut text = String::new();
+    let mut media: Vec<&str> = Vec::new();
+    for_each_array_element(raw, |vs, ve| {
+        let part = &raw[vs..ve];
+        match part_text_body(part) {
+            Some(Some(body)) => text.push_str(body),
+            Some(None) => {}
+            None => media.push(part),
+        }
+    })?;
+
+    let trimmed = raw_trim_start(&text);
+    if trimmed.starts_with(FOLD_THINK_OPEN) {
+        return None;
+    }
+
+    let mut body = String::with_capacity(text.len() + rc.len() + 16);
+    push_think_block(&mut body, rc);
+    if !raw_trim(&text).is_empty() {
+        body.push_str("\\n\\n");
+        body.push_str(trimmed);
+    }
+
+    let cap = body.len() + 32 + media.iter().map(|m| m.len() + 1).sum::<usize>();
+    let mut out = String::with_capacity(cap);
+    out.push_str("[{\"type\":\"text\",\"text\":\"");
+    out.push_str(&body);
+    out.push_str("\"}");
+    for m in media {
+        out.push(',');
+        out.push_str(m);
     }
     out.push(']');
-    RawValue::from_string(out).ok()
+    Some(out)
+}
+
+/// Rewrites one message element in place. Returns None when the element is not a
+/// foldable assistant turn (non-assistant, no reasoning, or already folded).
+fn fold_one_message(elem: &str) -> Option<String> {
+    if !elem.contains("assistant")
+        || (!elem.contains("\"reasoning_content\"") && !elem.contains("\"reasoning\""))
+    {
+        return None;
+    }
+
+    let spans = scan_message_spans(elem)?;
+
+    let (role_start, role_end) = spans.role?;
+    if elem.get(role_start..role_end)? != "\"assistant\"" {
+        return None;
+    }
+
+    // Non-empty reasoning, preferring "reasoning_content" over "reasoning".
+    let rc_raw = raw_string_body(elem, spans.reasoning_content)
+        .filter(|b| !raw_trim(b).is_empty())
+        .or_else(|| raw_string_body(elem, spans.reasoning).filter(|b| !raw_trim(b).is_empty()))?;
+
+    // Inner Tag Strip Guard: drop outer <think> / </think> the model already added.
+    let mut rc = raw_trim(rc_raw);
+    if let Some(rest) = rc.strip_prefix(FOLD_THINK_OPEN) {
+        rc = raw_trim_start(rest);
+    }
+    if let Some(rest) = rc.strip_suffix(FOLD_THINK_CLOSE) {
+        rc = raw_trim_end(rest);
+    }
+    let rc = raw_trim(rc);
+    if rc.is_empty() {
+        return None;
+    }
+
+    let content_span = spans.content;
+    let content_raw = match content_span {
+        Some((vs, ve)) => elem.get(vs..ve)?,
+        None => "",
+    };
+
+    // 5. Idempotency guard + 6. build the folded value (raw JSON text, no decode)
+    let new_value = match (content_span, content_raw) {
+        (None, _) | (_, "null") => {
+            // Null or absent content (e.g. tool call turns)
+            let mut body = String::with_capacity(rc.len() + 16);
+            push_think_block(&mut body, rc);
+            quote_json_string(&body)
+        }
+        (_, raw) if raw.starts_with('"') => {
+            let body = &raw[1..raw.len() - 1];
+            let trimmed = raw_trim_start(body);
+            if trimmed.starts_with(FOLD_THINK_OPEN) {
+                return None;
+            }
+            let mut s = String::with_capacity(body.len() + rc.len() + 16);
+            push_think_block(&mut s, rc);
+            if !raw_trim(body).is_empty() {
+                s.push_str("\\n\\n");
+                s.push_str(trimmed);
+            }
+            quote_json_string(&s)
+        }
+        (_, raw) if raw.starts_with('[') => fold_array_content(raw, rc)?,
+        (_, raw) => {
+            let trimmed = raw_trim_start(raw);
+            if trimmed.starts_with(FOLD_THINK_OPEN) {
+                return None;
+            }
+            // Non-string scalar/object content still folds into a *string*, so the
+            // raw JSON text has to be escaped before it is embedded.
+            let escaped = serde_json::to_string(trimmed).ok()?;
+            let mut s = String::with_capacity(escaped.len() + rc.len() + 16);
+            push_think_block(&mut s, rc);
+            s.push_str("\\n\\n");
+            s.push_str(&escaped[1..escaped.len() - 1]);
+            quote_json_string(&s)
+        }
+    };
+
+    // 7. Schema normalization: blank the reasoning keys the element actually carried.
+    // Injecting reasoning_content into a message that never had one can trip strict
+    // OpenAI-compatible schema validators, so absent keys stay absent.
+    let mut edits: Vec<(usize, usize, String)> = Vec::with_capacity(4);
+    let cap = elem.len() + new_value.len() + 16;
+    match content_span {
+        Some((vs, ve)) => edits.push((vs, ve, new_value)),
+        None => edits.push((
+            spans.obj_close,
+            spans.obj_close,
+            format!(",\"content\":{}", new_value),
+        )),
+    }
+    if let Some((vs, ve)) = spans.reasoning_content {
+        edits.push((vs, ve, "\"\"".to_string()));
+    }
+    if let Some((vs, ve)) = spans.reasoning {
+        edits.push((vs, ve, "\"\"".to_string()));
+    }
+    edits.sort_by_key(|e| e.0);
+
+    let mut out = String::with_capacity(cap);
+    let mut cursor = 0;
+    for (start, end, repl) in &edits {
+        if *start < cursor || *end > elem.len() || start > end {
+            return None;
+        }
+        out.push_str(elem.get(cursor..*start)?);
+        out.push_str(repl);
+        cursor = *end;
+    }
+    out.push_str(elem.get(cursor..)?);
+    Some(out)
 }
 
 /// Helper function to estimate serialized JSON capacity for upstream payloads.
@@ -5998,6 +6314,99 @@ mod tests {
             .find(|p| p["type"] == "image_url")
             .expect("image part must not be dropped");
         assert_eq!(media["image_url"]["url"], "https://example.test/cat.png");
+        assert_eq!(parsed[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn test_souffle_pout_non_string_content_is_escaped() {
+        // Non-string content still folds into a *string*: the JSON text has to be
+        // escaped when embedded, otherwise the spliced element is invalid JSON.
+        let raw = r#"[{"role":"assistant","content":{"a":1},"reasoning_content":"why"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fold object content");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\nwhy\n{FOLD_THINK_CLOSE}\n\n{{\"a\":1}}")
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn test_souffle_pout_reasoning_only_turn_gets_content_key() {
+        // Assistant turn with no `content` member at all: the splice must append one.
+        let raw = r#"[{"role":"assistant","reasoning_content":"pondering"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fold content-less turn");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\npondering\n{FOLD_THINK_CLOSE}")
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+        assert_eq!(parsed[0]["role"], "assistant");
+
+        // Empty reasoning_content falls back to `reasoning`; both end up blanked.
+        let raw =
+            r#"[{"role":"assistant","content":"ok","reasoning_content":"","reasoning":"deep"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fall back to reasoning");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\ndeep\n{FOLD_THINK_CLOSE}\n\nok")
+        );
+        assert_eq!(parsed[0]["reasoning"], "");
+    }
+
+    #[test]
+    fn test_souffle_pout_scanner_ignores_braces_inside_strings() {
+        // Tool arguments and reasoning carry braces and escaped quotes inside
+        // strings; the span scanner must not mistake them for structure.
+        let raw = json!([{
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": "use {\"a\":1} here",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{\"k\":\"v}\"}"}
+            }]
+        }])
+        .to_string();
+        let folded = fold_in_content_cot(&raw).expect("should fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\nuse {{\"a\":1}} here\n{FOLD_THINK_CLOSE}\n\ndone")
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+        assert_eq!(
+            parsed[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"k":"v}"}"#
+        );
+    }
+
+    #[test]
+    fn test_souffle_pout_fold_preserves_raw_escapes_byte_identically() {
+        // Content body mixes an escaped quote, escaped newline, an escaped solidus
+        // and raw multi-byte UTF-8. Folding must splice those bytes through as-is
+        // instead of decoding and re-encoding them.
+        let body_raw = r#"He said \"hi\"\n\u00e9 中文 🦀 a\/b"#;
+        let msgs_raw = format!(
+            r#"[{{"role":"assistant","reasoning_content":"think \"x\"\nline 2","content":"{}"}}]"#,
+            body_raw
+        );
+
+        let folded = fold_in_content_cot(&msgs_raw).expect("should fold escaped content");
+        let out = folded.get();
+        assert!(
+            out.contains(body_raw),
+            "raw content bytes must survive verbatim, got: {out}"
+        );
+
+        let parsed: Vec<Value> = serde_json::from_str(out).unwrap();
+        let expected = format!(
+            "{FOLD_THINK_OPEN}\nthink \"x\"\nline 2\n{FOLD_THINK_CLOSE}\n\nHe said \"hi\"\né 中文 🦀 a/b"
+        );
+        assert_eq!(parsed[0]["content"], expected);
         assert_eq!(parsed[0]["reasoning_content"], "");
     }
 
