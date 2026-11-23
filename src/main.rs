@@ -1762,21 +1762,27 @@ async fn chat_completions_raw_path(
         }
     }
 
-    let (msg_count, prepended_added, appended_added) =
-        if let Some(msgs_raw) = payload.get("messages") {
-            let (spliced_opt, count, p_add, a_add) = splice_messages_raw(
-                msgs_raw.get(),
-                preset.config.prepend_raw.as_deref(),
-                preset.config.prepend_messages.len(),
-                preset.config.append_raw.as_deref(),
-                preset.config.append_messages.len(),
-            );
-            if let Some(spliced) = spliced_opt {
-                payload.insert("messages".to_string(), spliced);
+    // Splice in preset messages lazily: the client array stays in place and the
+    // serializer emits prefix/inner/suffix ranges instead of a copied array.
+    let (msg_count, prepended_added, appended_added, spliced_messages) =
+        match payload.remove("messages") {
+            Some(msgs) => {
+                let (splice, count, p_add, a_add) = plan_messages_splice(
+                    msgs,
+                    preset.config.prepend_raw.as_deref(),
+                    preset.config.prepend_messages.len(),
+                    preset.config.append_raw.as_deref(),
+                    preset.config.append_messages.len(),
+                );
+                match splice {
+                    MsgsSplice::Verbatim(m) => {
+                        payload.insert("messages".to_string(), m);
+                        (count, p_add, a_add, None)
+                    }
+                    MsgsSplice::Spliced(s) => (count, p_add, a_add, Some(s)),
+                }
             }
-            (count, p_add, a_add)
-        } else {
-            (0, 0, 0)
+            None => (0, 0, 0, None),
         };
 
     if prepended_added > 0 {
@@ -1816,7 +1822,10 @@ async fn chat_completions_raw_path(
     dispatch_upstream(
         state.clone(),
         preset.clone(),
-        UpstreamPayload::Raw(payload),
+        UpstreamPayload {
+            map: payload,
+            spliced_messages,
+        },
         raw_len,
         is_stream,
         req_id,
@@ -1920,95 +1929,293 @@ fn scan_json_array(s: &str) -> Option<ArrayScan<'_>> {
     None
 }
 
+/// End offset (one past the closing quote) of the JSON string literal starting at `i`.
+/// Escape-aware: `\\` and `\"` never terminate the literal.
+fn scan_json_string_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        let pos = memchr::memchr2(b'"', b'\\', &bytes[i..])?;
+        let hit = i + pos;
+        if bytes[hit] == b'"' {
+            return Some(hit + 1);
+        }
+        // Escaped byte: skipping two is safe even for \uXXXX (hex digits
+        // are never a quote or a backslash).
+        i = hit + 2;
+    }
+    None
+}
+
+/// End offset (one past the last byte) of the JSON value starting at `i`.
+fn scan_json_value_end(bytes: &[u8], i: usize) -> Option<usize> {
+    match *bytes.get(i)? {
+        b'"' => scan_json_string_end(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => {
+                        j = scan_json_string_end(bytes, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            // Scalar (number/true/false/null): ends at a structural byte.
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b',' | b'}' | b']' => return Some(j),
+                    b if b.is_ascii_whitespace() => return Some(j),
+                    _ => j += 1,
+                }
+            }
+            Some(bytes.len())
+        }
+    }
+}
+
+/// Byte span `[start, end)` of a top-level object member's value.
+/// Only depth-1 members are examined, so nested `"model"` keys can't match.
+fn find_top_level_value_span(bytes: &[u8], key: &str) -> Option<(usize, usize)> {
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_start = i;
+        let key_end = scan_json_string_end(bytes, i)?;
+        let raw_key = &bytes[key_start + 1..key_end - 1];
+        let key_matches = raw_key == key.as_bytes()
+            || (raw_key.contains(&b'\\')
+                && std::str::from_utf8(&bytes[key_start..key_end])
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<String>(s).ok())
+                    .is_some_and(|s| s == key));
+        i = key_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let value_start = i;
+        let value_end = scan_json_value_end(bytes, i)?;
+        if key_matches {
+            return Some((value_start, value_end));
+        }
+        i = value_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b',') {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Outcome of swapping the top-level `"model"` literal in a serialized body.
+enum ModelPatch {
+    /// The body already carries this exact literal: nothing to rewrite.
+    Unchanged,
+    /// Body rebuilt with the new literal.
+    Replaced(Bytes),
+    /// `model` not found (or malformed body): caller must re-serialize.
+    NotFound,
+}
+
+/// Swap the top-level `"model"` value span inside an already-serialized body.
+///
+/// Byte-identical to re-serializing the whole payload map: top-level keys are
+/// emitted in `BTreeMap` order and the model value is a pre-serialized raw
+/// literal, so a model rotation can only move that one span. One memcpy beats
+/// re-serializing (and re-brotli'ing) multi-MB JSON while a permit is held.
+fn patch_serialized_model(body: &Bytes, model_raw: &str) -> ModelPatch {
+    let Some((value_start, value_end)) = find_top_level_value_span(body, "model") else {
+        return ModelPatch::NotFound;
+    };
+    let current = &body[value_start..value_end];
+    let new_literal = model_raw.as_bytes();
+    if current == new_literal {
+        return ModelPatch::Unchanged;
+    }
+    let mut out = BytesMut::with_capacity(body.len() - current.len() + new_literal.len());
+    out.extend_from_slice(&body[..value_start]);
+    out.extend_from_slice(new_literal);
+    out.extend_from_slice(&body[value_end..]);
+    ModelPatch::Replaced(out.freeze())
+}
+
 #[derive(serde::Deserialize)]
 struct RoleCheck<'a> {
     #[serde(borrow, default)]
     role: Option<&'a str>,
 }
 
+/// A `messages` array with preset prefix/suffix spliced in at serialize time.
+///
+/// Holds the client array verbatim plus the byte range of its element list, so
+/// emitting it is a couple of `extend_from_slice` calls instead of copying the
+/// whole (multi-MB) array into a fresh String and re-validating it as a RawValue.
+struct SplicedMessages {
+    /// Client array, byte-for-byte as received (CoT-folded content included).
+    body: Box<RawValue>,
+    /// Range between `[` and `]`, client whitespace included.
+    inner: std::ops::Range<usize>,
+    /// Comma-joined preset messages emitted right after `[`.
+    prefix: Option<String>,
+    /// Comma-joined preset messages emitted right before `]`.
+    suffix: Option<String>,
+}
+
+impl SplicedMessages {
+    /// Write `[prefix, <client elements>, suffix]` without materializing it.
+    fn emit_into(&self, buf: &mut Vec<u8>) {
+        buf.push(b'[');
+        let inner = &self.body.get().as_bytes()[self.inner.clone()];
+        let prefix = self.prefix.as_deref().filter(|p| !p.is_empty());
+        let suffix = self.suffix.as_deref().filter(|s| !s.is_empty());
+        if let Some(p) = prefix {
+            buf.extend_from_slice(p.as_bytes());
+        }
+        if !inner.is_empty() {
+            if prefix.is_some() {
+                buf.push(b',');
+            }
+            buf.extend_from_slice(inner);
+            if suffix.is_some() {
+                buf.push(b',');
+            }
+        }
+        if let Some(s) = suffix {
+            buf.extend_from_slice(s.as_bytes());
+        }
+        buf.push(b']');
+    }
+
+    fn estimated_len(&self) -> usize {
+        let inner = self.inner.end - self.inner.start;
+        2 + self.body.get().len() - inner
+            + self.prefix.as_ref().map_or(0, |p| p.len() + 1)
+            + self.suffix.as_ref().map_or(0, |s| s.len() + 1)
+    }
+}
+
+/// How `messages` should be emitted for this request.
+enum MsgsSplice {
+    /// Nothing to add: keep the array in the payload map untouched.
+    Verbatim(Box<RawValue>),
+    /// Prefix/suffix spliced from byte ranges at serialize time.
+    Spliced(SplicedMessages),
+}
+
+/// Decides whether preset prepend/append messages apply.
+///
 /// Preserves verbatim byte formatting of client elements while prepending system
 /// messages and/or appending prefill messages if the last message has role="user".
-/// Returns (Option<Box<RawValue>>, total_count, prepended_added, appended_added).
-fn splice_messages_raw(
-    s: &str,
+/// Returns byte ranges instead of a materialized copy of the array.
+/// Returns (splice, total_count, prepended_added, appended_added).
+fn plan_messages_splice(
+    body: Box<RawValue>,
     prepend_raw: Option<&str>,
     prepend_count: usize,
     append_raw: Option<&str>,
     append_count: usize,
-) -> (Option<Box<RawValue>>, usize, usize, usize) {
-    let scan = match scan_json_array(s) {
+) -> (MsgsSplice, usize, usize, usize) {
+    let scan = match scan_json_array(body.get()) {
         Some(sc) => sc,
-        None => return (None, 0, 0, 0),
+        None => return (MsgsSplice::Verbatim(body), 0, 0, 0),
     };
-
-    if prepend_raw.is_none() && append_raw.is_none() {
-        return (None, scan.element_count, 0, 0);
-    }
-
-    if scan.element_count == 0 {
-        // Empty client array `[]`
-        if let Some(prep) = prepend_raw {
-            let mut out = String::with_capacity(2 + prep.len());
-            out.push('[');
-            out.push_str(prep);
-            out.push(']');
-            if let Ok(rv) = RawValue::from_string(out) {
-                return (Some(rv), prepend_count, prepend_count, 0);
-            }
-        }
-        return (None, 0, 0, 0);
-    }
-
-    // Non-empty array (scan.element_count > 0)
-    let should_append = if append_raw.is_some() {
-        scan.last_element
+    let element_count = scan.element_count;
+    let inner = scan.inner_start..scan.inner_end;
+    // Append only applies when the conversation currently ends on a user turn.
+    let last_is_user = append_raw.is_some()
+        && scan
+            .last_element
             .and_then(|elem| serde_json::from_str::<RoleCheck>(elem).ok())
             .and_then(|rc| rc.role.map(|r| r == "user"))
-            .unwrap_or(false)
-    } else {
-        false
-    };
+            .unwrap_or(false);
+
+    if prepend_raw.is_none() && !last_is_user {
+        return (MsgsSplice::Verbatim(body), element_count, 0, 0);
+    }
+
+    if element_count == 0 {
+        // Empty client array `[]`: only a prepend can apply (no last role).
+        return match prepend_raw {
+            Some(prep) => (
+                MsgsSplice::Spliced(SplicedMessages {
+                    body,
+                    inner,
+                    prefix: Some(prep.to_string()),
+                    suffix: None,
+                }),
+                prepend_count,
+                prepend_count,
+                0,
+            ),
+            None => (MsgsSplice::Verbatim(body), 0, 0, 0),
+        };
+    }
 
     let p_add = if prepend_raw.is_some() {
         prepend_count
     } else {
         0
     };
-    let a_add = if should_append { append_count } else { 0 };
+    let a_add = if last_is_user { append_count } else { 0 };
 
     if p_add == 0 && a_add == 0 {
-        return (None, scan.element_count, 0, 0);
+        return (MsgsSplice::Verbatim(body), element_count, 0, 0);
     }
 
-    let inner = &s[scan.inner_start..scan.inner_end];
-    let cap = 2
-        + prepend_raw.map_or(0, |p| p.len() + 1)
-        + inner.len()
-        + if should_append {
-            append_raw.map_or(0, |a| a.len() + 1)
+    let spliced = SplicedMessages {
+        body,
+        inner,
+        prefix: prepend_raw.map(str::to_string),
+        suffix: if last_is_user {
+            append_raw.map(str::to_string)
         } else {
-            0
-        };
-
-    let mut out = String::with_capacity(cap);
-    out.push('[');
-    if let Some(prep) = prepend_raw {
-        out.push_str(prep);
-        out.push(',');
-    }
-    out.push_str(inner);
-    if should_append {
-        if let Some(app) = append_raw {
-            out.push(',');
-            out.push_str(app);
-        }
-    }
-    out.push(']');
-
-    match RawValue::from_string(out) {
-        Ok(rv) => (Some(rv), scan.element_count + p_add + a_add, p_add, a_add),
-        Err(_) => (None, scan.element_count, 0, 0),
-    }
+            None
+        },
+    };
+    (
+        MsgsSplice::Spliced(spliced),
+        element_count + p_add + a_add,
+        p_add,
+        a_add,
+    )
 }
 
 /// In-Content CoT Folding (`souffle_pout`):
@@ -2522,42 +2729,92 @@ pub fn estimate_payload_capacity(
 }
 
 /// The chat-completions request payload on its way upstream.
-enum UpstreamPayload {
-    Raw(BTreeMap<String, Box<RawValue>>),
+struct UpstreamPayload {
+    map: BTreeMap<String, Box<RawValue>>,
+    /// Present when preset prepend/append applies: `messages` lives here instead
+    /// of in `map` so the array is emitted from byte ranges, not a copy.
+    spliced_messages: Option<SplicedMessages>,
 }
 
 impl UpstreamPayload {
+    #[cfg(test)]
+    fn new(map: BTreeMap<String, Box<RawValue>>) -> Self {
+        Self {
+            map,
+            spliced_messages: None,
+        }
+    }
+
     /// Serialize payload directly into the pre-allocated buffer without reallocations.
     fn serialize_into(&self, buf: &mut Vec<u8>) -> Result<(), serde_json::Error> {
-        match self {
-            UpstreamPayload::Raw(m) => serde_json::to_writer(buf, m),
+        let Some(messages) = &self.spliced_messages else {
+            return serde_json::to_writer(buf, &self.map);
+        };
+        // Hand-emit so `messages` keeps the exact slot serde_json would give it
+        // in BTreeMap order (byte-identical output) while its array is written
+        // from ranges rather than a materialized String.
+        buf.push(b'{');
+        let mut first = true;
+        let mut messages_done = false;
+        for (k, v) in &self.map {
+            if k == "messages" {
+                continue;
+            }
+            if !messages_done && k.as_str() > "messages" {
+                push_member_sep(buf, &mut first);
+                buf.extend_from_slice(b"\"messages\":");
+                messages.emit_into(buf);
+                messages_done = true;
+            }
+            push_member_sep(buf, &mut first);
+            serde_json::to_writer(&mut *buf, k)?;
+            buf.push(b':');
+            buf.extend_from_slice(v.get().as_bytes());
         }
+        if !messages_done {
+            push_member_sep(buf, &mut first);
+            buf.extend_from_slice(b"\"messages\":");
+            messages.emit_into(buf);
+        }
+        buf.push(b'}');
+        Ok(())
     }
 
     /// Estimated serialized length of the payload in JSON format.
     #[allow(dead_code)]
     pub fn estimated_len(&self) -> usize {
-        match self {
-            UpstreamPayload::Raw(m) => {
-                2 + m.iter().map(|(k, v)| k.len() + v.get().len() + 4).sum::<usize>()
-            }
-        }
+        2 + self
+            .map
+            .iter()
+            .map(|(k, v)| k.len() + v.get().len() + 4)
+            .sum::<usize>()
+            + self
+                .spliced_messages
+                .as_ref()
+                .map_or(0, SplicedMessages::estimated_len)
     }
 
     /// Pre-allocated buffer capacity taking into account CoT expansion.
     pub fn estimated_capacity(&self, cot_active: bool) -> usize {
-        match self {
-            UpstreamPayload::Raw(m) => estimate_payload_capacity(m, cot_active),
-        }
+        estimate_payload_capacity(&self.map, cot_active)
+            + self
+                .spliced_messages
+                .as_ref()
+                .map_or(0, SplicedMessages::estimated_len)
     }
 
     /// Force `model` on multi-model retry rotation.
     fn rewrite_model(&mut self, model_raw: &RawValue) {
-        match self {
-            UpstreamPayload::Raw(m) => {
-                m.insert("model".to_string(), model_raw.to_owned());
-            }
-        }
+        self.map.insert("model".to_string(), model_raw.to_owned());
+    }
+}
+
+/// Append `,` between object members.
+fn push_member_sep(buf: &mut Vec<u8>, first: &mut bool) {
+    if *first {
+        *first = false;
+    } else {
+        buf.push(b',');
     }
 }
 
@@ -2770,8 +3027,8 @@ async fn dispatch_upstream(
         }
     };
 
-    // Compress the outbound body once; recomputed only when a multi-model
-    // retry re-serializes the payload below.
+    // Compress the outbound body once; retries only patch the model literal,
+    // so a re-encode happens only when that literal really changed.
     let mut outbound = prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
 
     let send_timeout = preset.config.read_timeout;
@@ -2791,13 +3048,36 @@ async fn dispatch_upstream(
                 preset.model_index.fetch_add(1, Ordering::Relaxed) % preset.config.models.len();
             let next_model = &preset.config.models[next_idx];
             let next_model_raw = &preset.config.models_raw[next_idx];
-            payload.rewrite_model(next_model_raw);
-            let mut buf = Vec::with_capacity(payload.estimated_capacity(cot_active));
-            if payload.serialize_into(&mut buf).is_ok() {
-                payload_bytes = Bytes::from(buf);
+            // A rotation only swaps the top-level model literal, so splice that
+            // span in the already-serialized body instead of re-serializing (and
+            // re-brotli'ing) multi-MB JSON on every retry under the permit.
+            match patch_serialized_model(&payload_bytes, next_model_raw.get()) {
+                ModelPatch::Unchanged => {}
+                ModelPatch::Replaced(patched) => {
+                    payload_bytes = patched;
+                    // Brotli output is content-dependent, so a changed literal
+                    // always invalidates it (identical literals took the
+                    // Unchanged arm above and keep the old encode).
+                    outbound = if preset.config.brotli_enabled {
+                        prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await
+                    } else {
+                        OutboundBody {
+                            bytes: payload_bytes.clone(),
+                            is_brotli: false,
+                        }
+                    };
+                }
+                // Body shape not recognized: fall back to a full re-serialize.
+                ModelPatch::NotFound => {
+                    payload.rewrite_model(next_model_raw);
+                    let mut buf = Vec::with_capacity(payload.estimated_capacity(cot_active));
+                    if payload.serialize_into(&mut buf).is_ok() {
+                        payload_bytes = Bytes::from(buf);
+                        outbound =
+                            prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
+                    }
+                }
             }
-            // The rotated payload is a different serialization: recompress.
-            outbound = prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
             log(
                 &format!(
                     "Retrying attempt {}/{} with alternative model: {} (preset '{}', model {}/{})",
@@ -5247,6 +5527,19 @@ mod tests {
         Arc<AtomicUsize>,
         Arc<std::sync::atomic::AtomicBool>,
     ) {
+        spawn_mock_h2_server_with_bodies(replies, Arc::new(std::sync::Mutex::new(Vec::new()))).await
+    }
+
+    /// Same mock, plus every received request body in arrival order.
+    async fn spawn_mock_h2_server_with_bodies(
+        replies: Vec<MockUpstreamReply>,
+        bodies: Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let attempts = Arc::new(AtomicUsize::new(0));
@@ -5263,6 +5556,7 @@ mod tests {
                 let attempts = attempts_srv.clone();
                 let chunks_sent = chunks_srv.clone();
                 let reset_observed = reset_srv.clone();
+                let bodies = bodies.clone();
                 tokio::spawn(async move {
                     let mut h2_conn = match h2::server::handshake(tcp).await {
                         Ok(c) => c,
@@ -5270,8 +5564,13 @@ mod tests {
                     };
                     while let Some(Ok((req, mut respond))) = h2_conn.accept().await {
                         let mut req_body = req.into_body();
+                        let mut captured: Vec<u8> = Vec::new();
                         while let Some(Ok(frame)) = req_body.data().await {
                             let _ = req_body.flow_control().release_capacity(frame.len());
+                            captured.extend_from_slice(&frame);
+                        }
+                        if !captured.is_empty() {
+                            bodies.lock().unwrap().push(captured);
                         }
                         let idx = attempts.fetch_add(1, Ordering::SeqCst);
                         let reply = replies.get(idx).or_else(|| replies.last()).cloned().unwrap();
@@ -5902,7 +6201,7 @@ mod tests {
         // Out-of-order top-level keys: the Raw path alphabetizes top-level keys on serialize
         let json_body = r#"{"stream":true,"temperature":0.7,"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}"#;
         let m: BTreeMap<String, Box<RawValue>> = serde_json::from_str(json_body).unwrap();
-        let mut p_raw = UpstreamPayload::Raw(m);
+        let mut p_raw = UpstreamPayload::new(m);
 
         let mut buf_raw = Vec::new();
         p_raw.serialize_into(&mut buf_raw).unwrap();
@@ -5934,12 +6233,143 @@ mod tests {
         // RawValue preserves \u0041 unescaped verbatim to avoid prompt drift
         let raw_body = r#"{"messages":[{"content":"\u0041"}]}"#;
         let m_verbatim: BTreeMap<String, Box<RawValue>> = serde_json::from_str(raw_body).unwrap();
-        let p_verbatim = UpstreamPayload::Raw(m_verbatim);
+        let p_verbatim = UpstreamPayload::new(m_verbatim);
         let mut buf_verbatim = Vec::new();
         p_verbatim.serialize_into(&mut buf_verbatim).unwrap();
         assert!(String::from_utf8(buf_verbatim)
             .unwrap()
             .contains(r#""\u0041""#));
+    }
+
+    #[test]
+    fn retry_model_patch_is_byte_identical_to_full_reserialize() {
+        // Client body whose messages embed an escaped `"model"` key: the patch
+        // scanner must only touch the depth-1 member.
+        let body = r#"{"messages":[{"role":"user","content":"{\"model\":\"evil\",\"a\":1}"}],"model":"model-a","stream":true,"temperature":0.7}"#;
+        let map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(body).unwrap();
+
+        let mut first_buf = Vec::new();
+        serde_json::to_writer(&mut first_buf, &map).unwrap();
+        let mut patched = Bytes::from(first_buf);
+
+        // 3 retries with rotation, mixed literal lengths.
+        let rotation = [
+            "\"z-ai/glm-5.3-alt\"",
+            "\"m-b\"",
+            "\"model-a-longer-name\"",
+        ];
+        for literal in rotation {
+            // Reference body: what the pre-patch code emitted (map rewrite +
+            // full re-serialize).
+            let mut reference_map = map.clone();
+            reference_map.insert(
+                "model".to_string(),
+                RawValue::from_string(literal.to_string()).unwrap(),
+            );
+            let mut ref_buf = Vec::new();
+            serde_json::to_writer(&mut ref_buf, &reference_map).unwrap();
+
+            match patch_serialized_model(&patched, literal) {
+                ModelPatch::Replaced(next) => patched = next,
+                _ => panic!("expected a model span patch for {literal}"),
+            }
+            assert_eq!(
+                patched.as_ref(),
+                ref_buf.as_slice(),
+                "patched body diverged from full re-serialize for {literal}"
+            );
+        }
+
+        let parsed: Value = serde_json::from_slice(&patched).unwrap();
+        assert_eq!(parsed["model"], "model-a-longer-name");
+        assert_eq!(parsed["messages"][0]["content"], r#"{"model":"evil","a":1}"#);
+    }
+
+    #[test]
+    fn model_patch_reports_unchanged_and_not_found() {
+        let body = r#"{"model":"m-a","stream":true}"#;
+        let bytes = Bytes::from_static(body.as_bytes());
+        assert!(matches!(
+            patch_serialized_model(&bytes, "\"m-a\""),
+            ModelPatch::Unchanged
+        ));
+        assert!(matches!(
+            patch_serialized_model(&bytes, "\"m-b\""),
+            ModelPatch::Replaced(_)
+        ));
+
+        // No top-level model (only a nested one): caller must re-serialize.
+        let nested = Bytes::from_static(br#"{"messages":[{"model":"x"}]}"#);
+        assert!(matches!(
+            patch_serialized_model(&nested, "\"m-b\""),
+            ModelPatch::NotFound
+        ));
+        // Malformed body: no panic, just NotFound.
+        let junk = Bytes::from_static(br#"{"model":"#);
+        assert!(matches!(
+            patch_serialized_model(&junk, "\"m-b\""),
+            ModelPatch::NotFound
+        ));
+    }
+
+    #[test]
+    fn spliced_payload_serializes_byte_identically_to_materialized_array() {
+        let prep = r#"{"role":"system","content":"sys"}"#;
+        let app = r#"{"role":"assistant","content":"prefill"}"#;
+        let body = r#"{"stream":true,"temperature":0.7,"messages":[ {"role":"user","content":"hi"} ],"model":"m-a","max_tokens":32}"#;
+
+        let mut map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(body).unwrap();
+        let msgs = map.remove("messages").unwrap();
+        let (splice, count, p_add, a_add) =
+            plan_messages_splice(msgs, Some(prep), 1, Some(app), 1);
+        assert_eq!((count, p_add, a_add), (3, 1, 1));
+        let payload = UpstreamPayload {
+            map,
+            spliced_messages: match splice {
+                MsgsSplice::Spliced(s) => Some(s),
+                MsgsSplice::Verbatim(_) => panic!("expected a splice"),
+            },
+        };
+        let mut buf = Vec::new();
+        payload.serialize_into(&mut buf).unwrap();
+        // Byte-for-byte what the old copy-the-array implementation emitted:
+        // top-level keys sorted, client whitespace inside the array preserved.
+        assert_eq!(
+            String::from_utf8(buf).unwrap(),
+            concat!(
+                r#"{"max_tokens":32,"messages":[{"role":"system","content":"sys"},"#,
+                r#" {"role":"user","content":"hi"} ,"#,
+                r#"{"role":"assistant","content":"prefill"}],"#,
+                r#""model":"m-a","stream":true,"temperature":0.7}"#
+            )
+        );
+
+        // `messages` sorting last must still emit (tail branch), and the array
+        // must stay parseable.
+        let tail_body = r#"{"max_tokens":1,"messages":[{"role":"user","content":"hi"}]}"#;
+        let mut tail_map: BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(tail_body).unwrap();
+        let tail_msgs = tail_map.remove("messages").unwrap();
+        let (tail_splice, _, _, _) = plan_messages_splice(tail_msgs, Some(prep), 1, None, 0);
+        let tail_payload = UpstreamPayload {
+            map: tail_map,
+            spliced_messages: match tail_splice {
+                MsgsSplice::Spliced(s) => Some(s),
+                MsgsSplice::Verbatim(_) => panic!("expected a splice"),
+            },
+        };
+        let mut tail_buf = Vec::new();
+        tail_payload.serialize_into(&mut tail_buf).unwrap();
+        let tail_str = String::from_utf8(tail_buf).unwrap();
+        assert_eq!(
+            tail_str,
+            concat!(
+                r#"{"max_tokens":1,"messages":[{"role":"system","content":"sys"},"#,
+                r#"{"role":"user","content":"hi"}]}"#
+            )
+        );
+        let parsed: Value = serde_json::from_str(&tail_str).unwrap();
+        assert_eq!(parsed["messages"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -5997,28 +6427,49 @@ mod tests {
         );
     }
 
+    /// Test-only view of the lazy splice: materialize what the serializer emits.
+    fn splice_to_string(
+        body: &str,
+        prepend: Option<&str>,
+        prepend_count: usize,
+        append: Option<&str>,
+        append_count: usize,
+    ) -> (Option<String>, usize, usize, usize) {
+        let boxed = RawValue::from_string(body.to_string()).unwrap();
+        let (splice, count, p_add, a_add) =
+            plan_messages_splice(boxed, prepend, prepend_count, append, append_count);
+        let out = match splice {
+            MsgsSplice::Verbatim(_) => None,
+            MsgsSplice::Spliced(s) => {
+                let mut buf = Vec::new();
+                s.emit_into(&mut buf);
+                Some(String::from_utf8(buf).unwrap())
+            }
+        };
+        (out, count, p_add, a_add)
+    }
+
     #[test]
-    fn splice_messages_raw_handles_empty_and_whitespace() {
+    fn splice_messages_handles_empty_and_whitespace() {
         let prep = r#"{"role":"system","content":"sys"}"#;
         let app = r#"{"role":"assistant","content":"prefill"}"#;
 
         // Empty array with prepend
-        let (res, count, p_add, a_add) = splice_messages_raw("[]", Some(prep), 1, None, 0);
+        let (res, count, p_add, a_add) = splice_to_string("[]", Some(prep), 1, None, 0);
         assert_eq!(count, 1);
         assert_eq!(p_add, 1);
         assert_eq!(a_add, 0);
-        assert_eq!(res.unwrap().get(), r#"[{"role":"system","content":"sys"}]"#);
+        assert_eq!(res.unwrap(), r#"[{"role":"system","content":"sys"}]"#);
 
         // Empty array with whitespace and prepend
-        let (res, count, p_add, a_add) =
-            splice_messages_raw("  [  \n  ]  ", Some(prep), 1, None, 0);
+        let (res, count, p_add, a_add) = splice_to_string("  [  \n  ]  ", Some(prep), 1, None, 0);
         assert_eq!(count, 1);
         assert_eq!(p_add, 1);
         assert_eq!(a_add, 0);
-        assert_eq!(res.unwrap().get(), r#"[{"role":"system","content":"sys"}]"#);
+        assert_eq!(res.unwrap(), r#"[{"role":"system","content":"sys"}]"#);
 
         // Empty array with append only: should NOT append because last role is not user
-        let (res, count, p_add, a_add) = splice_messages_raw("[]", None, 0, Some(app), 1);
+        let (res, count, p_add, a_add) = splice_to_string("[]", None, 0, Some(app), 1);
         assert_eq!(count, 0);
         assert_eq!(p_add, 0);
         assert_eq!(a_add, 0);
@@ -6026,7 +6477,7 @@ mod tests {
     }
 
     #[test]
-    fn splice_messages_raw_preserves_client_byte_verbatim() {
+    fn splice_messages_preserves_client_byte_verbatim() {
         let prep = r#"{"role":"system","content":"sys"}"#;
         let app = r#"{"role":"assistant","content":"prefill"}"#;
 
@@ -6035,13 +6486,12 @@ mod tests {
 
         // Prepend and append together
         let (res, count, p_add, a_add) =
-            splice_messages_raw(client_msgs, Some(prep), 1, Some(app), 1);
+            splice_to_string(client_msgs, Some(prep), 1, Some(app), 1);
         assert_eq!(count, 3);
         assert_eq!(p_add, 1);
         assert_eq!(a_add, 1);
 
-        let spliced = res.unwrap();
-        let spliced_str = spliced.get();
+        let spliced_str = res.unwrap();
 
         // Exact verbatim client preservation: \u0041 unmutated, custom key order preserved
         assert!(
@@ -6051,7 +6501,7 @@ mod tests {
         assert!(spliced_str.ends_with(r#"{"role":"assistant","content":"prefill"}]"#));
 
         // Semantic JSON parse verification
-        let parsed: Value = serde_json::from_str(spliced_str).unwrap();
+        let parsed: Value = serde_json::from_str(&spliced_str).unwrap();
         let arr = parsed.as_array().unwrap();
         assert_eq!(arr.len(), 3);
         assert_eq!(arr[0]["role"], "system");
@@ -6061,13 +6511,13 @@ mod tests {
     }
 
     #[test]
-    fn splice_messages_raw_respects_last_role_condition() {
+    fn splice_messages_respects_last_role_condition() {
         let app = r#"{"role":"assistant","content":"prefill"}"#;
 
         // Last message is assistant -> do NOT append
         let msgs_assistant =
             r#"[{"role":"user","content":"hi"},{"role":"assistant","content":"bye"}]"#;
-        let (res, count, p_add, a_add) = splice_messages_raw(msgs_assistant, None, 0, Some(app), 1);
+        let (res, count, p_add, a_add) = splice_to_string(msgs_assistant, None, 0, Some(app), 1);
         assert_eq!(count, 2);
         assert_eq!(p_add, 0);
         assert_eq!(a_add, 0);
@@ -6075,18 +6525,21 @@ mod tests {
 
         // Last message is user -> append
         let msgs_user = r#"[{"role":"assistant","content":"bye"},{"role":"user","content":"hi"}]"#;
-        let (res, count, p_add, a_add) = splice_messages_raw(msgs_user, None, 0, Some(app), 1);
+        let (res, count, p_add, a_add) = splice_to_string(msgs_user, None, 0, Some(app), 1);
         assert_eq!(count, 3);
         assert_eq!(p_add, 0);
         assert_eq!(a_add, 1);
         let spliced = res.unwrap();
-        assert!(spliced
-            .get()
-            .ends_with(r#"{"role":"assistant","content":"prefill"}]"#));
+        assert!(spliced.ends_with(r#"{"role":"assistant","content":"prefill"}]"#));
 
         // Malformed / non-array messages -> untouched
-        let (res_none, count_none, _, _) =
-            splice_messages_raw("not an array", Some("prep"), 1, Some(app), 1);
+        let (res_none, count_none, _, _) = splice_to_string(
+            r#""not an array""#,
+            Some(r#"{"role":"system"}"#),
+            1,
+            Some(app),
+            1,
+        );
         assert_eq!(count_none, 0);
         assert!(res_none.is_none());
     }
@@ -6590,7 +7043,7 @@ mod tests {
         let val = RawValue::from_string("\"v\"".to_string()).unwrap();
         map.insert("k".to_string(), val);
 
-        let payload = UpstreamPayload::Raw(map);
+        let payload = UpstreamPayload::new(map);
         let expected_base = 2 + ("k".len() + "\"v\"".len() + 4);
         assert_eq!(payload.estimated_len(), expected_base);
         assert_eq!(payload.estimated_capacity(false), expected_base + 32 + 1024);
@@ -7269,6 +7722,123 @@ mod tests {
         let resp_tmo = handle_chat_completions(State(state_tmo), make_chat_req(false)).await;
         assert_eq!(resp_tmo.status(), StatusCode::OK);
         assert_eq!(attempts_tmo.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn e2e_multi_model_retry_bodies_match_full_serialization() {
+        // Every attempt must ship exactly what the old full-serialize path sent:
+        // only the model literal changes between retries.
+        let good_json = Bytes::from(
+            r#"{"id":"ok","choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (addr, attempts, _, _) = spawn_mock_h2_server_with_bodies(
+            vec![
+                MockUpstreamReply::BufferedReset,
+                MockUpstreamReply::BufferedReset,
+                MockUpstreamReply::BufferedJson(good_json),
+            ],
+            bodies.clone(),
+        )
+        .await;
+
+        let prep = r#"{"role":"system","content":"sys"}"#;
+        let app = r#"{"role":"assistant","content":"prefill"}"#;
+        let mut cfg = (*make_test_app_state(&format!("http://{addr}/v1"), false, 3).slots[0]
+            .config)
+            .clone();
+        cfg.models = vec![
+            "model-a".to_string(),
+            "model-b".to_string(),
+            "z-ai/model-c-long".to_string(),
+        ];
+        cfg.models_raw = models_to_raw(&cfg.models).unwrap();
+        cfg.prepend_raw = Some(prep.to_string());
+        cfg.prepend_messages = vec![json!({"role": "system", "content": "sys"})];
+        cfg.append_raw = Some(app.to_string());
+        cfg.append_messages = vec![json!({"role": "assistant", "content": "prefill"})];
+        let client = UpstreamClient::H2(
+            H2Client::new(
+                &cfg.upstream_bases,
+                cfg.connect_timeout,
+                cfg.keepalive_expiry,
+                true,
+            )
+            .unwrap(),
+        );
+        let state = Arc::new(AppState {
+            slots: vec![Arc::new(PresetRuntime {
+                config: Arc::new(cfg),
+                client,
+                model_index: AtomicUsize::new(0),
+                key_index: AtomicUsize::new(0),
+            })],
+            semaphore: Arc::new(Semaphore::new(20)),
+            stats: Arc::new(ProxyStats::new()),
+            stripped_headers: HashSet::new(),
+        });
+        let resp = handle_chat_completions(State(state.clone()), make_chat_req(false)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+
+        // Reference: old implementation = materialized messages array + full
+        // re-serialize of the payload map per rotation.
+        let client_body = json!({
+            "model": "deepseek-souffle",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": false
+        })
+        .to_string();
+        let mut client_map: BTreeMap<String, Box<RawValue>> =
+            serde_json::from_str(&client_body).unwrap();
+        let client_msgs = client_map.remove("messages").unwrap();
+        let spliced = {
+            let (splice, count, _, _) =
+                plan_messages_splice(client_msgs.clone(), Some(prep), 1, Some(app), 1);
+            assert_eq!(count, 3);
+            let mut out = Vec::new();
+            match splice {
+                MsgsSplice::Spliced(s) => s.emit_into(&mut out),
+                MsgsSplice::Verbatim(_) => panic!("expected a splice"),
+            }
+            String::from_utf8(out).unwrap()
+        };
+
+        let captured = bodies.lock().unwrap();
+        assert_eq!(captured.len(), 3, "each attempt must send a body");
+        // The real serialized body (spliced messages included) must be patchable,
+        // otherwise dispatch would quietly fall back to a full re-serialize.
+        assert!(matches!(
+            patch_serialized_model(&Bytes::copy_from_slice(&captured[0]), "\"model-b\""),
+            ModelPatch::Replaced(_)
+        ));
+        for (idx, model) in ["model-a", "model-b", "z-ai/model-c-long"]
+            .iter()
+            .enumerate()
+        {
+            let mut reference = client_map.clone();
+            reference.insert(
+                "messages".to_string(),
+                RawValue::from_string(spliced.clone()).unwrap(),
+            );
+            reference.insert(
+                "model".to_string(),
+                RawValue::from_string(format!("\"{model}\"")).unwrap(),
+            );
+            let mut reference_buf = Vec::new();
+            serde_json::to_writer(&mut reference_buf, &reference).unwrap();
+
+            assert_eq!(
+                captured[idx],
+                reference_buf,
+                "attempt {idx} body differs from the full-serialize reference"
+            );
+            let parsed: Value = serde_json::from_slice(&captured[idx]).unwrap();
+            assert_eq!(parsed["model"], *model);
+            assert_eq!(parsed["messages"].as_array().unwrap().len(), 3);
+            assert_eq!(parsed["messages"][0]["role"], "system");
+            assert_eq!(parsed["messages"][2]["role"], "assistant");
+        }
     }
 
     #[tokio::test]
