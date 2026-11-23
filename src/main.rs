@@ -2340,11 +2340,13 @@ fn part_text_body(part: &str) -> Option<Option<&str>> {
     for_each_object_member(part, |key, vs, ve| {
         if key == "\"text\"" {
             let raw = &part[vs..ve];
-            found = Some(if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
-                Some(&raw[1..raw.len() - 1])
-            } else {
-                None
-            });
+            found = Some(
+                if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+                    Some(&raw[1..raw.len() - 1])
+                } else {
+                    None
+                },
+            );
         }
     })?;
     found
@@ -6326,7 +6328,8 @@ mod tests {
         assert_eq!(parsed[0]["role"], "assistant");
 
         // Empty reasoning_content falls back to `reasoning`; both end up blanked.
-        let raw = r#"[{"role":"assistant","content":"ok","reasoning_content":"","reasoning":"deep"}]"#;
+        let raw =
+            r#"[{"role":"assistant","content":"ok","reasoning_content":"","reasoning":"deep"}]"#;
         let folded = fold_in_content_cot(raw).expect("should fall back to reasoning");
         let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
         assert_eq!(
