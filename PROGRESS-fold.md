@@ -12,3 +12,13 @@ Base: `bc587f5`
 
 ## Log
 - (start) read brief, located fn at src/main.rs:2018, tests at 5826-6060 + 6750.
+- impl: replaced Map round-trip with span scanner (`for_each_object_member`,
+  `scan_json_value_end`, `scan_json_string_end` using memchr2) + value splicing.
+  Raw trim helpers understand `\n`/`\t`/`\r`/`\u00XX` so rc stays escaped.
+- fix: emitted array text part was missing its closing `}` (caught by
+  test_souffle_pout_array_multimodal_content). clippy needless_lifetimes on
+  raw_string_body.
+- gate: `cargo test` 74 passed / 0 failed; clippy `-D warnings` clean -> commit cf9346e.
+- added tests: raw-escape byte-identity (\" \n \u00e9 中文 🦀 \/), plus
+  content-key-absent insert path and empty-reasoning_content fallback.
+- gate: `cargo test` 75 passed / 0 failed; clippy clean.

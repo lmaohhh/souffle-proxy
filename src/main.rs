@@ -6313,6 +6313,58 @@ mod tests {
     }
 
     #[test]
+    fn test_souffle_pout_reasoning_only_turn_gets_content_key() {
+        // Assistant turn with no `content` member at all: the splice must append one.
+        let raw = r#"[{"role":"assistant","reasoning_content":"pondering"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fold content-less turn");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\npondering\n{FOLD_THINK_CLOSE}")
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+        assert_eq!(parsed[0]["role"], "assistant");
+
+        // Empty reasoning_content falls back to `reasoning`; both end up blanked.
+        let raw = r#"[{"role":"assistant","content":"ok","reasoning_content":"","reasoning":"deep"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fall back to reasoning");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\ndeep\n{FOLD_THINK_CLOSE}\n\nok")
+        );
+        assert_eq!(parsed[0]["reasoning"], "");
+    }
+
+    #[test]
+    fn test_souffle_pout_scanner_ignores_braces_inside_strings() {
+        // Tool arguments and reasoning carry braces and escaped quotes inside
+        // strings; the span scanner must not mistake them for structure.
+        let raw = json!([{
+            "role": "assistant",
+            "content": "done",
+            "reasoning_content": "use {\"a\":1} here",
+            "tool_calls": [{
+                "id": "c1",
+                "type": "function",
+                "function": {"name": "f", "arguments": "{\"k\":\"v}\"}"}
+            }]
+        }])
+        .to_string();
+        let folded = fold_in_content_cot(&raw).expect("should fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\nuse {{\"a\":1}} here\n{FOLD_THINK_CLOSE}\n\ndone")
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+        assert_eq!(
+            parsed[0]["tool_calls"][0]["function"]["arguments"],
+            r#"{"k":"v}"}"#
+        );
+    }
+
+    #[test]
     fn test_souffle_pout_fold_preserves_raw_escapes_byte_identically() {
         // Content body mixes an escaped quote, escaped newline, an escaped solidus
         // and raw multi-byte UTF-8. Folding must splice those bytes through as-is
