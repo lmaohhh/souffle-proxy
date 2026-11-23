@@ -651,8 +651,6 @@ impl H2Client {
     /// stream is already dead, so the pooled connection is dropped only to get a
     /// clean socket for the retry. Unlike H3 there is no collateral damage --
     /// the h2 driver task keeps in-flight streams alive on its own.
-    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
-    #[allow(dead_code)]
     pub async fn invalidate_stream_if_same(&self, failed_id: u64) {
         self.invalidate_if_same(failed_id).await;
     }
@@ -1121,8 +1119,6 @@ impl H3Client {
     /// would abort every concurrent response multiplexed onto it -- one
     /// request's retryable reset would take out the whole in-flight batch.
     /// Callers must use `invalidate_if_same` only for connection-level faults.
-    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
-    #[allow(dead_code)]
     pub async fn invalidate_stream_if_same(&self, _failed_id: u64) {}
 
     async fn connect_raw(&self, target: &Target) -> Result<ActiveH3Conn, UpstreamError> {

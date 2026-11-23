@@ -2272,64 +2272,6 @@ struct MsgFieldSpans {
     obj_close: usize,
 }
 
-/// Returns the index just past the closing quote of the JSON string at `i`.
-/// SIMD `memchr2` skips string bodies at memory bandwidth, same trick as `scan_json_array`.
-fn scan_json_string_end(bytes: &[u8], i: usize) -> Option<usize> {
-    if bytes.get(i) != Some(&b'"') {
-        return None;
-    }
-    let mut i = i + 1;
-    while i < bytes.len() {
-        let hit = i + memchr::memchr2(b'"', b'\\', &bytes[i..])?;
-        if bytes[hit] == b'"' {
-            return Some(hit + 1);
-        }
-        // Escapes are never truncated inside a well-formed string.
-        i = hit + 2;
-    }
-    None
-}
-
-/// Returns the index just past the JSON value starting at `i`.
-fn scan_json_value_end(bytes: &[u8], i: usize) -> Option<usize> {
-    match *bytes.get(i)? {
-        b'"' => scan_json_string_end(bytes, i),
-        b'{' | b'[' => {
-            let mut depth = 0u32;
-            let mut j = i;
-            while j < bytes.len() {
-                match bytes[j] {
-                    b'"' => {
-                        j = scan_json_string_end(bytes, j)?;
-                        continue;
-                    }
-                    b'{' | b'[' => depth += 1,
-                    b'}' | b']' => {
-                        depth = depth.checked_sub(1)?;
-                        if depth == 0 {
-                            return Some(j + 1);
-                        }
-                    }
-                    _ => {}
-                }
-                j += 1;
-            }
-            None
-        }
-        _ => {
-            // Number / true / false / null: ends at the next structural delimiter.
-            let mut j = i;
-            while j < bytes.len()
-                && !matches!(bytes[j], b',' | b'}' | b']')
-                && !bytes[j].is_ascii_whitespace()
-            {
-                j += 1;
-            }
-            (j > i).then_some(j)
-        }
-    }
-}
-
 /// Walks the top-level members of a JSON object, handing each key (quotes included)
 /// and its value span to `f`. Returns the index of the closing brace.
 fn for_each_object_member(s: &str, mut f: impl FnMut(&str, usize, usize)) -> Option<usize> {
@@ -3275,6 +3217,9 @@ async fn dispatch_upstream(
                     let first_chunk = match first_chunk_res {
                         Ok(Some(Ok(c))) => c,
                         Ok(Some(Err(e))) => {
+                            // Classify once: a per-stream reset must not tear down the
+                            // shared connection and the other requests riding it.
+                            let stream_scoped = e.is_stream_scoped();
                             match e {
                                 UpstreamError::H2StreamReset { error_code: 7 }
                                 | UpstreamError::H3StreamReset { error_code: 0x010b } => {
@@ -3282,7 +3227,8 @@ async fn dispatch_upstream(
                                     if free_retries < MAX_FREE_RETRIES {
                                         free_retries += 1;
                                         log(&format!("Upstream stream reset (error=REFUSED/REJECTED). Retrying immediately (free retry {}/{})...", free_retries, MAX_FREE_RETRIES), Some(&req_id));
-                                        preset.client.invalidate_if_same(conn_id).await;
+                                        // Stream-scoped: the connection is healthy, leave concurrent responses alone.
+                                        preset.client.invalidate_stream_if_same(conn_id).await;
                                         drop(stream);
                                         tokio::time::sleep(Duration::from_millis(10)).await;
                                         continue;
@@ -3301,7 +3247,7 @@ async fn dispatch_upstream(
                                         "Upstream stream reset (error=CANCEL / H3_REQUEST_CANCELLED)",
                                         Some(&req_id),
                                     );
-                                    preset.client.invalidate_if_same(conn_id).await;
+                                    preset.client.invalidate_stream_if_same(conn_id).await;
                                     if attempt < preset.config.max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt);
@@ -3346,7 +3292,11 @@ async fn dispatch_upstream(
                                 | UpstreamError::H3GoAway { error_code: 0x0107 } => {
                                     // GOAWAY ENHANCE_YOUR_CALM / H3_EXCESSIVE_LOAD → retry with 2x backoff
                                     log("Upstream overloaded (error=ENHANCE_YOUR_CALM / H3_EXCESSIVE_LOAD). Backing off 2x...", Some(&req_id));
-                                    preset.client.invalidate_if_same(conn_id).await;
+                                    if stream_scoped {
+                                        preset.client.invalidate_stream_if_same(conn_id).await;
+                                    } else {
+                                        preset.client.invalidate_if_same(conn_id).await;
+                                    }
                                     if attempt < preset.config.max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt) * 2;
@@ -3692,6 +3642,7 @@ async fn dispatch_upstream(
             }
             Ok(Err(send_err)) => {
                 let failed_conn_id = send_err.conn_id;
+                let stream_scoped = send_err.error.is_stream_scoped();
                 match send_err.error {
                     UpstreamError::H2StreamReset { error_code: 7 }
                     | UpstreamError::H3StreamReset { error_code: 0x010b } => {
@@ -3700,7 +3651,7 @@ async fn dispatch_upstream(
                             free_retries += 1;
                             log(&format!("Upstream stream reset (error=REFUSED/REJECTED). Retrying immediately (free retry {}/{})...", free_retries, MAX_FREE_RETRIES), Some(&req_id));
                             if let Some(cid) = failed_conn_id {
-                                preset.client.invalidate_if_same(cid).await;
+                                preset.client.invalidate_stream_if_same(cid).await;
                             }
                             tokio::time::sleep(Duration::from_millis(10)).await;
                             continue;
@@ -3717,7 +3668,7 @@ async fn dispatch_upstream(
                         // CANCEL / H3_REQUEST_CANCELLED → retry with normal backoff (mirrors the first-chunk branch)
                         log("Upstream stream reset (error=CANCEL / H3_REQUEST_CANCELLED)", Some(&req_id));
                         if let Some(cid) = failed_conn_id {
-                            preset.client.invalidate_if_same(cid).await;
+                            preset.client.invalidate_stream_if_same(cid).await;
                         }
                         if attempt < preset.config.max_retry - 1 {
                             let delay = retry_delay(attempt);
@@ -3759,7 +3710,11 @@ async fn dispatch_upstream(
                     | UpstreamError::H3GoAway { error_code: 0x0107 } => {
                         log("Upstream overloaded (error=ENHANCE_YOUR_CALM / H3_EXCESSIVE_LOAD). Backing off 2x...", Some(&req_id));
                         if let Some(cid) = failed_conn_id {
-                            preset.client.invalidate_if_same(cid).await;
+                            if stream_scoped {
+                                preset.client.invalidate_stream_if_same(cid).await;
+                            } else {
+                                preset.client.invalidate_if_same(cid).await;
+                            }
                         }
                         if attempt < preset.config.max_retry - 1 {
                             let delay = retry_delay(attempt) * 2;
@@ -4314,9 +4269,14 @@ fn stream_response(
                         break 'stream_loop;
                     }
                     if let Some(e) = post_drain_err {
+                        let stream_scoped = e.is_stream_scoped();
                         truncation_reason = Some(log_midstream_upstream_error(e, &req_id_clone));
                         downstream_broke = true;
-                        preset_clone.client.invalidate_if_same(conn_id).await;
+                        if stream_scoped {
+                            preset_clone.client.invalidate_stream_if_same(conn_id).await;
+                        } else {
+                            preset_clone.client.invalidate_if_same(conn_id).await;
+                        }
                         state_clone.stats.error_count.fetch_add(1, Ordering::Relaxed);
                         break 'stream_loop;
                     }
@@ -4325,9 +4285,14 @@ fn stream_response(
                     }
                 }
                 Some(Some(Err(e))) => {
+                    let stream_scoped = e.is_stream_scoped();
                     truncation_reason = Some(log_midstream_upstream_error(e, &req_id_clone));
                     downstream_broke = true;
-                    preset_clone.client.invalidate_if_same(conn_id).await;
+                    if stream_scoped {
+                        preset_clone.client.invalidate_stream_if_same(conn_id).await;
+                    } else {
+                        preset_clone.client.invalidate_if_same(conn_id).await;
+                    }
                     state_clone.stats.error_count.fetch_add(1, Ordering::Relaxed);
                     break;
                 }
