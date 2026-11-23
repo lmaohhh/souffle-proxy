@@ -3537,7 +3537,13 @@ async fn dispatch_upstream(
                     {
                         Ok(Ok(b)) => b,
                         Ok(Err(e)) => {
-                            preset.client.invalidate_if_same(conn_id).await;
+                            // Same scope rule as the mid-stream arms: a per-stream reset
+                            // leaves the shared connection (and its other responses) alive.
+                            if e.is_stream_scoped() {
+                                preset.client.invalidate_stream_if_same(conn_id).await;
+                            } else {
+                                preset.client.invalidate_if_same(conn_id).await;
+                            }
                             log(&format!("Upstream body read error: {}", e), Some(&req_id));
                             if attempt < preset.config.max_retry - 1 {
                                 let delay = retry_delay(attempt);
