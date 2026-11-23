@@ -2125,10 +2125,14 @@ impl SplicedMessages {
     }
 
     fn estimated_len(&self) -> usize {
-        let inner = self.inner.end - self.inner.start;
-        2 + self.body.get().len() - inner
+        // The client array itself is the dominant term: `map` holds no `messages`
+        // entry when splicing, so omitting it here made the outbound Vec double
+        // once (a full memcpy) on every spliced request -- the copy the splice
+        // exists to avoid.
+        self.body.get().len()
             + self.prefix.as_ref().map_or(0, |p| p.len() + 1)
             + self.suffix.as_ref().map_or(0, |s| s.len() + 1)
+            + 1
     }
 }
 
@@ -2458,11 +2462,110 @@ fn raw_string_body(src: &str, span: Option<(usize, usize)>) -> Option<&str> {
     }
 }
 
-/// `<think>\n{rc}\n</think>` written as JSON string body (escapes stay escaped).
-fn push_think_block(out: &mut String, rc: &str) {
+/// Text being folded, in one of two domains: `escaped` keeps the original JSON
+/// escapes byte-for-byte (plain ASCII, spliced as-is), while a decoded value
+/// holds real text that must be re-escaped on output. An escaped tag only looks
+/// like `<​think>` once decoded, so a body carrying a backslash starts out decoded
+/// — otherwise both the tag strip and the idempotency guard miss `\u003c`.
+struct FoldText<'a> {
+    text: std::borrow::Cow<'a, str>,
+    escaped: bool,
+}
+
+impl<'a> FoldText<'a> {
+    /// `body` is the inner text of a JSON string value (surrounding quotes stripped).
+    fn from_body(body: &'a str) -> Self {
+        // Decode when the body carries an escape or non-ASCII text: escapes need
+        // resolving (so \u003c matches a literal tag), and Unicode whitespace such as
+        // NBSP must be trimmable the way str::trim does it. Pure ASCII with no
+        // backslash stays borrowed.
+        if body.bytes().any(|b| b == b'\\' || b >= 0x80) {
+            if let Some(decoded) = decode_json_string_body(body) {
+                return Self::decoded(decoded);
+            }
+            // Undecodable (e.g. an unpaired surrogate): leave the bytes alone and
+            // let the element-level check decide whether folding is safe.
+        }
+        Self::raw(body)
+    }
+
+    fn raw(text: &'a str) -> Self {
+        Self {
+            text: std::borrow::Cow::Borrowed(text),
+            escaped: true,
+        }
+    }
+
+    fn decoded(text: String) -> Self {
+        Self {
+            text: std::borrow::Cow::Owned(text),
+            escaped: false,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Trim whitespace in this text's domain, over any slice of it.
+    fn trim<'s>(&self, s: &'s str) -> &'s str {
+        if self.escaped {
+            raw_trim(s)
+        } else {
+            s.trim()
+        }
+    }
+
+    fn trim_start<'s>(&self, s: &'s str) -> &'s str {
+        if self.escaped {
+            raw_trim_start(s)
+        } else {
+            s.trim_start()
+        }
+    }
+
+    fn trim_end<'s>(&self, s: &'s str) -> &'s str {
+        if self.escaped {
+            raw_trim_end(s)
+        } else {
+            s.trim_end()
+        }
+    }
+
+    /// Append a slice of this text as JSON string body bytes.
+    fn write(&self, s: &str, out: &mut String) {
+        if self.escaped {
+            out.push_str(s);
+        } else {
+            escape_json_body_into(s, out);
+        }
+    }
+}
+
+/// Decode one JSON string body (quotes stripped). `None` when the escapes are not
+/// valid JSON text, e.g. an unpaired surrogate.
+fn decode_json_string_body(body: &str) -> Option<String> {
+    let mut quoted = String::with_capacity(body.len() + 2);
+    quoted.push('"');
+    quoted.push_str(body);
+    quoted.push('"');
+    serde_json::from_str(&quoted).ok()
+}
+
+/// Append `s` as JSON string body bytes (no surrounding quotes).
+fn escape_json_body_into(s: &str, out: &mut String) {
+    // serde_json cannot fail on a &str; dropping the quotes lets the escaped text
+    // splice into an existing string value.
+    if let Ok(quoted) = serde_json::to_string(s) {
+        out.push_str(&quoted[1..quoted.len() - 1]);
+    }
+}
+
+/// `<​think>\n{rc}\n<​/think>` written as JSON string body.
+fn push_think_block(out: &mut String, rc: &FoldText<'_>, rc_text: &str) {
     out.push_str(FOLD_THINK_OPEN);
     out.push_str("\\n");
-    out.push_str(rc);
+    rc.write(rc_text, out);
     out.push_str("\\n");
     out.push_str(FOLD_THINK_CLOSE);
 }
@@ -2501,30 +2604,42 @@ fn part_text_body(part: &str) -> Option<Option<&str>> {
     found
 }
 
-/// Folds array content: text parts are concatenated raw and become the first text
+/// Folds array content: text parts are concatenated and become the first text
 /// part; every non-text part is re-emitted verbatim so media is never dropped.
-fn fold_array_content(raw: &str, rc: &str) -> Option<String> {
-    let mut text = String::new();
+fn fold_array_content(raw: &str, rc: &FoldText<'_>, rc_text: &str) -> Option<String> {
+    let mut bodies: Vec<&str> = Vec::new();
     let mut media: Vec<&str> = Vec::new();
     for_each_array_element(raw, |vs, ve| {
         let part = &raw[vs..ve];
         match part_text_body(part) {
-            Some(Some(body)) => text.push_str(body),
+            Some(Some(body)) => bodies.push(body),
             Some(None) => {}
             None => media.push(part),
         }
     })?;
 
-    let trimmed = raw_trim_start(&text);
+    // Joining raw bodies only stays valid while every part is plain ASCII: one
+    // escaped part would leave the joined text half-decoded.
+    let text = if bodies.iter().any(|b| b.bytes().any(|c| c == b'\\')) {
+        let mut decoded = String::with_capacity(bodies.iter().map(|b| b.len()).sum());
+        for body in &bodies {
+            decoded.push_str(&decode_json_string_body(body)?);
+        }
+        FoldText::decoded(decoded)
+    } else {
+        FoldText::decoded(bodies.concat())
+    };
+
+    let trimmed = text.trim_start(text.as_str());
     if trimmed.starts_with(FOLD_THINK_OPEN) {
         return None;
     }
 
-    let mut body = String::with_capacity(text.len() + rc.len() + 16);
-    push_think_block(&mut body, rc);
-    if !raw_trim(&text).is_empty() {
+    let mut body = String::with_capacity(text.as_str().len() + rc_text.len() + 16);
+    push_think_block(&mut body, rc, rc_text);
+    if !text.trim(text.as_str()).is_empty() {
         body.push_str("\\n\\n");
-        body.push_str(trimmed);
+        text.write(trimmed, &mut body);
     }
 
     let cap = body.len() + 32 + media.iter().map(|m| m.len() + 1).sum::<usize>();
@@ -2540,12 +2655,34 @@ fn fold_array_content(raw: &str, rc: &str) -> Option<String> {
     Some(out)
 }
 
+/// The reasoning text of a message (preferred key first, whitespace-only values
+/// skipped), decoded once into the domain folding needs.
+fn pick_reasoning<'a>(elem: &'a str, spans: &MsgFieldSpans) -> Option<FoldText<'a>> {
+    for span in [spans.reasoning_content, spans.reasoning] {
+        let Some(body) = raw_string_body(elem, span) else {
+            continue;
+        };
+        let text = FoldText::from_body(body);
+        if !text.trim(text.as_str()).is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
 /// Rewrites one message element in place. Returns None when the element is not a
 /// foldable assistant turn (non-assistant, no reasoning, or already folded).
 fn fold_one_message(elem: &str) -> Option<String> {
     if !elem.contains("assistant")
         || (!elem.contains("\"reasoning_content\"") && !elem.contains("\"reasoning\""))
     {
+        return None;
+    }
+
+    // Escaped elements get one validation pass: an unpaired surrogate (or any other
+    // invalid escape) would otherwise be re-emitted verbatim as invalid JSON. Only
+    // elements that actually carry a \u escape pay for this.
+    if elem.contains("\\u") && serde_json::from_str::<Value>(elem).is_err() {
         return None;
     }
 
@@ -2557,19 +2694,18 @@ fn fold_one_message(elem: &str) -> Option<String> {
     }
 
     // Non-empty reasoning, preferring "reasoning_content" over "reasoning".
-    let rc_raw = raw_string_body(elem, spans.reasoning_content)
-        .filter(|b| !raw_trim(b).is_empty())
-        .or_else(|| raw_string_body(elem, spans.reasoning).filter(|b| !raw_trim(b).is_empty()))?;
+    let rc_text = pick_reasoning(elem, &spans)?;
 
-    // Inner Tag Strip Guard: drop outer <think> / </think> the model already added.
-    let mut rc = raw_trim(rc_raw);
+    // Inner Tag Strip Guard: drop outer <​think> / <​/think> the model already added.
+    // Running it in the text's own domain is what makes `\u003cthink\u003e` match.
+    let mut rc = rc_text.trim(rc_text.as_str());
     if let Some(rest) = rc.strip_prefix(FOLD_THINK_OPEN) {
-        rc = raw_trim_start(rest);
+        rc = rc_text.trim_start(rest);
     }
     if let Some(rest) = rc.strip_suffix(FOLD_THINK_CLOSE) {
-        rc = raw_trim_end(rest);
+        rc = rc_text.trim_end(rest);
     }
-    let rc = raw_trim(rc);
+    let rc = rc_text.trim(rc);
     if rc.is_empty() {
         return None;
     }
@@ -2580,39 +2716,43 @@ fn fold_one_message(elem: &str) -> Option<String> {
         None => "",
     };
 
-    // 5. Idempotency guard + 6. build the folded value (raw JSON text, no decode)
+    // 5. Idempotency guard + 6. build the folded value
     let new_value = match (content_span, content_raw) {
         (None, _) | (_, "null") => {
             // Null or absent content (e.g. tool call turns)
             let mut body = String::with_capacity(rc.len() + 16);
-            push_think_block(&mut body, rc);
+            push_think_block(&mut body, &rc_text, rc);
             quote_json_string(&body)
         }
         (_, raw) if raw.starts_with('"') => {
             let body = &raw[1..raw.len() - 1];
-            let trimmed = raw_trim_start(body);
+            let content = FoldText::from_body(body);
+            let trimmed = content.trim_start(content.as_str());
             if trimmed.starts_with(FOLD_THINK_OPEN) {
                 return None;
             }
             let mut s = String::with_capacity(body.len() + rc.len() + 16);
-            push_think_block(&mut s, rc);
-            if !raw_trim(body).is_empty() {
+            push_think_block(&mut s, &rc_text, rc);
+            if !content.trim(content.as_str()).is_empty() {
                 s.push_str("\\n\\n");
-                s.push_str(trimmed);
+                content.write(trimmed, &mut s);
             }
             quote_json_string(&s)
         }
-        (_, raw) if raw.starts_with('[') => fold_array_content(raw, rc)?,
+        (_, raw) if raw.starts_with('[') => fold_array_content(raw, &rc_text, rc)?,
         (_, raw) => {
             let trimmed = raw_trim_start(raw);
             if trimmed.starts_with(FOLD_THINK_OPEN) {
                 return None;
             }
-            // Non-string scalar/object content still folds into a *string*, so the
-            // raw JSON text has to be escaped before it is embedded.
-            let escaped = serde_json::to_string(trimmed).ok()?;
+            // Non-string scalar/object content still folds into a *string*. Decode the
+            // JSON value first (escapes resolved, numbers normalised) so the text the
+            // model sees matches the pre-splice behaviour, then escape it for embedding.
+            let value: Value = serde_json::from_str(trimmed).ok()?;
+            let as_text = value.to_string();
+            let escaped = serde_json::to_string(&as_text).ok()?;
             let mut s = String::with_capacity(escaped.len() + rc.len() + 16);
-            push_think_block(&mut s, rc);
+            push_think_block(&mut s, &rc_text, rc);
             s.push_str("\\n\\n");
             s.push_str(&escaped[1..escaped.len() - 1]);
             quote_json_string(&s)
@@ -3340,12 +3480,33 @@ async fn dispatch_upstream(
                                         &format!("Upstream GOAWAY error_code={}", error_code),
                                     );
                                 }
+                                other if is_terminal_upstream_error(&other) => {
+                                    // Terminal: the same request is too large for the peer on
+                                    // any connection. Retrying (and evicting the pool each
+                                    // time) cannot succeed, so surface it immediately.
+                                    log(
+                                        &format!("Upstream request rejected: {}", other),
+                                        Some(&req_id),
+                                    );
+                                    state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                                    return make_text_response(
+                                        StatusCode::BAD_GATEWAY,
+                                        &format!("Upstream error: {}", other),
+                                    );
+                                }
                                 other => {
                                     log(
                                         &format!("Upstream error on first chunk: {}", other),
                                         Some(&req_id),
                                     );
-                                    preset.client.invalidate_if_same(conn_id).await;
+                                    // Only a connection-level fault may evict the pool: for H3
+                                    // that call closes the QUIC connection and aborts every
+                                    // concurrent response riding it.
+                                    if stream_scoped {
+                                        preset.client.invalidate_stream_if_same(conn_id).await;
+                                    } else {
+                                        preset.client.invalidate_if_same(conn_id).await;
+                                    }
                                     if attempt < preset.config.max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt);
@@ -3516,7 +3677,13 @@ async fn dispatch_upstream(
                     {
                         Ok(Ok(b)) => b,
                         Ok(Err(e)) => {
-                            preset.client.invalidate_if_same(conn_id).await;
+                            // Same scope rule as the mid-stream arms: a per-stream reset
+                            // leaves the shared connection (and its other responses) alive.
+                            if e.is_stream_scoped() {
+                                preset.client.invalidate_stream_if_same(conn_id).await;
+                            } else {
+                                preset.client.invalidate_if_same(conn_id).await;
+                            }
                             log(&format!("Upstream body read error: {}", e), Some(&req_id));
                             if attempt < preset.config.max_retry - 1 {
                                 let delay = retry_delay(attempt);
@@ -3761,10 +3928,25 @@ async fn dispatch_upstream(
                             &format!("Upstream GOAWAY error_code={}", error_code),
                         );
                     }
+                    other if is_terminal_upstream_error(&other) => {
+                        // Same terminal rule as the first-chunk arm: no retry, no eviction.
+                        log(&format!("Upstream request rejected: {}", other), Some(&req_id));
+                        state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        return make_text_response(
+                            StatusCode::BAD_GATEWAY,
+                            &format!("Upstream error: {}", other),
+                        );
+                    }
                     other => {
                         log(&format!("Network error: {}", other), Some(&req_id));
                         if let Some(cid) = failed_conn_id {
-                            preset.client.invalidate_if_same(cid).await;
+                            // Same rule as the first-chunk catch-all: a stream-scoped
+                            // failure must not tear down the shared connection.
+                            if stream_scoped {
+                                preset.client.invalidate_stream_if_same(cid).await;
+                            } else {
+                                preset.client.invalidate_if_same(cid).await;
+                            }
                         }
                         if attempt < preset.config.max_retry - 1 {
                             let delay = retry_delay(attempt);
@@ -3933,6 +4115,13 @@ impl Drop for StreamDisconnectGuard {
             );
         }
     }
+}
+
+/// Failures that are terminal for this request: the identical bytes fail the same
+/// way on a fresh connection, so retrying only burns the retry budget and evicts a
+/// healthy pool entry on every attempt.
+fn is_terminal_upstream_error(e: &UpstreamError) -> bool {
+    matches!(e, UpstreamError::HeaderTooBig { .. })
 }
 
 fn log_midstream_upstream_error(e: UpstreamError, req_id: &str) -> &'static str {
@@ -6278,6 +6467,37 @@ mod tests {
     }
 
     #[test]
+    fn spliced_messages_estimated_len_covers_emitted_bytes() {
+        // 100 KB client array + prefix + suffix: the estimate must not collapse to
+        // the ~4 bytes of the old `2 + body - inner` arithmetic, or `with_capacity`
+        // under-allocates and the outbound Vec doubles once per request.
+        let big = "x".repeat(100_000);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{big}"}},{{"role":"assistant","content":"ok"}}]}}"#
+        );
+        let prep = r#"{"role":"system","content":"sys"}"#;
+        let app = r#"{"role":"assistant","content":"prefill"}"#;
+        let mut map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&body).unwrap();
+        let msgs = map.remove("messages").unwrap();
+        let (splice, _, _, _) = plan_messages_splice(msgs, Some(prep), 1, Some(app), 1);
+        let spliced = match splice {
+            MsgsSplice::Spliced(s) => s,
+            MsgsSplice::Verbatim(_) => panic!("expected a splice"),
+        };
+
+        let mut emitted = Vec::new();
+        spliced.emit_into(&mut emitted);
+        assert!(
+            spliced.estimated_len() >= emitted.len(),
+            "estimate {} must cover the {} emitted bytes",
+            spliced.estimated_len(),
+            emitted.len()
+        );
+        // ...and it must not be wildly oversized either (one allocation, no doubling).
+        assert!(spliced.estimated_len() <= emitted.len() + 8);
+    }
+
+    #[test]
     fn spliced_payload_serializes_byte_identically_to_materialized_array() {
         let prep = r#"{"role":"system","content":"sys"}"#;
         let app = r#"{"role":"assistant","content":"prefill"}"#;
@@ -6644,6 +6864,48 @@ mod tests {
     }
 
     #[test]
+    fn test_souffle_pout_escaped_think_tags_are_recognised() {
+        // Differential repro: the model spells its tags as \u003c escapes, so the
+        // byte compare against "<​think>" never matched. The whole tag block ended
+        // up nested inside the freshly emitted one.
+        let msgs = concat!(
+            r#"[{"role":"assistant","reasoning_content":"\u003cthink\u003erc\u003c/think\u003e","#,
+            r#""content":"Answer"}]"#
+        );
+        let folded = fold_in_content_cot(msgs).expect("escaped tags must still fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\nrc\n{FOLD_THINK_CLOSE}\n\nAnswer"),
+            "escaped tags in reasoning_content must be stripped, not nested"
+        );
+        assert_eq!(parsed[0]["reasoning_content"], "");
+
+        // Uppercase hex spellings must be recognised too.
+        let upper = concat!(
+            r#"[{"role":"assistant","reasoning_content":"\u003Cthink\u003Edeep\u003C/think\u003E","#,
+            r#""content":"ok"}]"#
+        );
+        let folded_upper = fold_in_content_cot(upper).expect("uppercase escapes must fold");
+        let parsed_upper: Vec<Value> = serde_json::from_str(folded_upper.get()).unwrap();
+        assert_eq!(
+            parsed_upper[0]["content"],
+            format!("{FOLD_THINK_OPEN}\ndeep\n{FOLD_THINK_CLOSE}\n\nok")
+        );
+
+        // Content that already starts with an escaped think block must not be
+        // folded again: that is the double-wrap the harness caught.
+        let already = concat!(
+            r#"[{"role":"assistant","content":"\u003cthink\u003ealready folded\u003c/think\u003e\n\nAnswer","#,
+            r#""reasoning_content":"duplicate reasoning"}]"#
+        );
+        assert!(
+            fold_in_content_cot(already).is_none(),
+            "an escaped think block already in content must trip the idempotency guard"
+        );
+    }
+
+    #[test]
     fn test_souffle_pout_idempotency_guard() {
         let raw = json!([
             {
@@ -6736,6 +6998,40 @@ mod tests {
     }
 
     #[test]
+    fn test_souffle_pout_lone_surrogate_is_not_folded() {
+        // Unpaired surrogate: the element is already invalid JSON. Folding must not
+        // claim it and must not re-emit it as a (still invalid) folded body.
+        let raw = r#"[{"role":"assistant","content":"\ud800","reasoning_content":"thinking"}]"#;
+        assert!(fold_in_content_cot(raw).is_none());
+    }
+
+    #[test]
+    fn test_souffle_pout_non_string_content_is_normalized() {
+        // Matches the pre-splice semantics: decode the value, then embed its text,
+        // so 1e2 reaches the model as 100.0 rather than the client's literal.
+        let raw = r#"[{"role":"assistant","content":1e2,"reasoning_content":"r"}]"#;
+        let folded = fold_in_content_cot(raw).expect("numeric content should fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        let text = parsed[0]["content"].as_str().expect("content is a string");
+        assert!(text.ends_with("100.0"), "unexpected text: {text}");
+    }
+
+    #[test]
+    fn test_souffle_pout_unicode_whitespace_is_trimmed() {
+        // Parity with the pre-splice code: content is start-trimmed with str::trim_start
+        // (Unicode-aware), so leading NBSP disappears while trailing bytes are kept.
+        let raw = "[{\"role\":\"assistant\",\"content\":\"\\u00a0padded\\u00a0\",\"reasoning_content\":\"r\"}]";
+        let folded = fold_in_content_cot(raw).expect("should fold");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        let text = parsed[0]["content"].as_str().unwrap();
+        assert!(
+            !text.trim_start_matches('\u{a0}').starts_with('\u{a0}'),
+            "leading NBSP must be trimmed like str::trim_start: {text:?}"
+        );
+        assert!(text.contains("padded"), "unexpected text: {text:?}");
+    }
+
+    #[test]
     fn test_souffle_pout_non_string_content_is_escaped() {
         // Non-string content still folds into a *string*: the JSON text has to be
         // escaped when embedded, otherwise the spliced element is invalid JSON.
@@ -6805,8 +7101,10 @@ mod tests {
     #[test]
     fn test_souffle_pout_fold_preserves_raw_escapes_byte_identically() {
         // Content body mixes an escaped quote, escaped newline, an escaped solidus
-        // and raw multi-byte UTF-8. Folding must splice those bytes through as-is
-        // instead of decoding and re-encoding them.
+        // and raw multi-byte UTF-8. A body carrying escapes is decoded once (the
+        // tag guards and str::trim need real text, FIX 7/9) and re-escaped on
+        // output, which is what the pre-merge implementation emitted. Plain-ASCII
+        // bodies never take that path and stay byte-identical.
         let body_raw = r#"He said \"hi\"\n\u00e9 中文 🦀 a\/b"#;
         let msgs_raw = format!(
             r#"[{{"role":"assistant","reasoning_content":"think \"x\"\nline 2","content":"{}"}}]"#,
@@ -6815,10 +7113,6 @@ mod tests {
 
         let folded = fold_in_content_cot(&msgs_raw).expect("should fold escaped content");
         let out = folded.get();
-        assert!(
-            out.contains(body_raw),
-            "raw content bytes must survive verbatim, got: {out}"
-        );
 
         let parsed: Vec<Value> = serde_json::from_str(out).unwrap();
         let expected = format!(
@@ -6826,6 +7120,20 @@ mod tests {
         );
         assert_eq!(parsed[0]["content"], expected);
         assert_eq!(parsed[0]["reasoning_content"], "");
+
+        // The plain-ASCII fast path still splices client bytes verbatim.
+        let plain = fold_in_content_cot(
+            r#"[{"role":"assistant","reasoning_content":"think","content":"  plain ascii body"}]"#,
+        )
+        .expect("should fold plain content");
+        let expected_plain = format!(
+            r#""content":"{FOLD_THINK_OPEN}\nthink\n{FOLD_THINK_CLOSE}\n\nplain ascii body""#
+        );
+        assert!(
+            plain.get().contains(&expected_plain),
+            "plain-ASCII content must be spliced byte-for-byte, got: {}",
+            plain.get()
+        );
     }
 
     #[test]
@@ -7468,6 +7776,46 @@ mod tests {
             classify_retry(&err_dirty_goaway, 0, MAX_RETRY, 0, MAX_FREE),
             RetryAction::TerminalError(502)
         );
+    }
+
+    #[test]
+    fn test_header_too_big_dispatch_is_terminal() {
+        // HeaderTooBig is permanent for this request: dispatch must answer 502 at
+        // once instead of retrying up to max_retry and evicting the pooled
+        // connection on every attempt.
+        let e = UpstreamError::HeaderTooBig {
+            actual_size: 65_536,
+            max_size: 16_384,
+        };
+        assert!(
+            is_terminal_upstream_error(&e),
+            "HeaderTooBig must be dispatched on the terminal arm"
+        );
+        // ...and it must not take either invalidation path on the way out.
+        assert!(
+            !e.is_stream_scoped(),
+            "HeaderTooBig must not evict a single stream"
+        );
+        assert!(
+            !e.is_connection_closing(),
+            "HeaderTooBig must not evict the pooled connection"
+        );
+
+        // Failures that stay retryable must not be swallowed by the terminal arm.
+        for e in [
+            UpstreamError::H2StreamReset { error_code: 0x0102 },
+            UpstreamError::H3StreamReset { error_code: 0x0102 },
+            UpstreamError::H2GoAway { error_code: 0 },
+            UpstreamError::H3GoAway { error_code: 0x0100 },
+            UpstreamError::Connect(std::io::Error::other("dial")),
+            UpstreamError::Timeout,
+            UpstreamError::Other("boom".into()),
+        ] {
+            assert!(
+                !is_terminal_upstream_error(&e),
+                "{e} must keep its existing retry behaviour"
+            );
+        }
     }
 
     #[test]
