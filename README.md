@@ -67,6 +67,21 @@ Compile from source on the machine you run it on (requires Rust toolchain):
 cargo build --release
 ```
 
+**On Windows, use the bundled wrapper instead:**
+
+```bat
+scripts\build.bat build --release
+```
+
+It loads Microsoft's `vcvars64.bat` (locating the install via `vswhere`, with a
+fallback scan of the standard install roots for preview VS versions that the
+bundled locator cannot see) and then runs `cargo` with whatever arguments you
+pass. This matters because the linker needs the MSVC/Windows SDK import
+libraries, which only exist on `LIB` after `vcvars64.bat` runs — and because a
+stray `link.exe` earlier in `PATH` (MSYS coreutils ships one) is otherwise
+picked up instead of MSVC's linker. `.cargo/config.toml` pins `rust-lld`, so the
+linker is never resolved by name from `PATH`.
+
 `.cargo/config.toml` pins `-C target-cpu=native` so the binary uses your CPU's own SIMD/AVX2/AVX-512 instructions out of the box. No Windows prebuilt binaries or tailored support are offered here—build it yourself, inspect the source, and adjust `config.json` to match your own setup.
 
 `config.json` and `.env` live **beside the exe** (using `std::env::current_exe()`):
