@@ -647,18 +647,21 @@ impl H2Client {
         }
     }
 
-    /// Stream-scoped failure (RST_STREAM REFUSED_STREAM / CANCEL): the request
-    /// stream is already dead, so the pooled connection is dropped only to get a
-    /// clean socket for the retry. Unlike H3 there is no collateral damage --
-    /// the h2 driver task keeps in-flight streams alive on its own.
-    pub async fn invalidate_stream_if_same(&self, failed_id: u64) {
-        self.invalidate_if_same(failed_id).await;
-    }
+    /// Stream-scoped failure (RST_STREAM REFUSED_STREAM / CANCEL): a no-op.
+    ///
+    /// The reset stream is already dead and the h2 driver task owns the
+    /// connection: evicting the pool entry here would abort the keepalive PING
+    /// and force a fresh TCP+TLS+h2 handshake on the retry, without freeing
+    /// anything that is still alive.
+    pub async fn invalidate_stream_if_same(&self, _failed_id: u64) {}
 
     async fn connect_raw(&self, target: &Target) -> Result<ActiveConn, UpstreamError> {
         // ONE deadline for the whole attempt (TCP + TLS + h2 handshake). Applying
         // connect_timeout to each stage serially let a dead peer hold the
-        // connect_lock for up to 3x the configured budget.
+        // connect_lock for up to 3x the configured budget. The post-TCP stages
+        // are floored (see `h2_stage_budget`) so a slow dial cannot leave TLS
+        // with a few milliseconds: the attempt stays bounded by
+        // connect_timeout + 2 * min(connect_timeout, H2_STAGE_FLOOR).
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
         let remaining = |deadline: tokio::time::Instant| -> Result<Duration, UpstreamError> {
             deadline
@@ -686,11 +689,14 @@ impl H2Client {
                 })?
                 .to_owned();
 
-            let tls =
-                tokio::time::timeout(remaining(deadline)?, connector.connect(server_name, tcp))
-                    .await
-                    .map_err(|_| UpstreamError::Timeout)?
-                    .map_err(UpstreamError::Connect)?;
+            let tls_budget = h2_stage_budget(
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+                self.connect_timeout,
+            );
+            let tls = tokio::time::timeout(tls_budget, connector.connect(server_name, tcp))
+                .await
+                .map_err(|_| UpstreamError::Timeout)?
+                .map_err(UpstreamError::Connect)?;
 
             UpstreamStream::Tls(Box::new(tls))
         } else {
@@ -707,11 +713,14 @@ impl H2Client {
         // Mimic the working profile: no overrides at all.
         let builder = h2::client::Builder::new();
 
-        let (send_req, connection) =
-            tokio::time::timeout(remaining(deadline)?, builder.handshake(stream))
-                .await
-                .map_err(|_| UpstreamError::Timeout)?
-                .map_err(UpstreamError::from)?;
+        let handshake_budget = h2_stage_budget(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            self.connect_timeout,
+        );
+        let (send_req, connection) = tokio::time::timeout(handshake_budget, builder.handshake(stream))
+            .await
+            .map_err(|_| UpstreamError::Timeout)?
+            .map_err(UpstreamError::from)?;
 
         let last_goaway = Arc::new(AtomicI64::new(-1));
         let last_goaway_conn = last_goaway.clone();
@@ -984,6 +993,18 @@ const H3_HANDSHAKE_FLOOR: Duration = Duration::from_secs(2);
 /// `connect_timeout`, so a deliberately tiny budget stays tiny).
 fn h3_handshake_budget(remaining: Duration, connect_timeout: Duration) -> Duration {
     remaining.max(connect_timeout.min(H3_HANDSHAKE_FLOOR))
+}
+
+/// Floor for the post-TCP stages of an H2 attempt (TLS + h2 handshake). A 29.9s
+/// TCP connect used to leave TLS ~100ms — a recoverable path turned into
+/// `Timeout` — because the merge replaced per-stage budgets with one deadline.
+const H2_STAGE_FLOOR: Duration = Duration::from_secs(2);
+
+/// Timeout for a post-TCP stage: whatever is left of the connect budget, but
+/// never less than a bounded floor (itself capped by `connect_timeout`, so a
+/// deliberately tiny budget stays tiny).
+fn h2_stage_budget(remaining: Duration, connect_timeout: Duration) -> Duration {
+    remaining.max(connect_timeout.min(H2_STAGE_FLOOR))
 }
 
 #[derive(Clone)]
@@ -1434,13 +1455,11 @@ impl UpstreamClient {
         }
     }
 
-    /// Connection-level invalidation is only correct for faults that affect the
-    /// whole connection (GOAWAY, protocol error, connect failure, TTFT wedge).
-    /// Stream-scoped resets must go through here instead: on H3 they leave the
-    /// shared QUIC connection healthy, and tearing it down would abort every
-    /// other response multiplexed on it.
-    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
-    #[allow(dead_code)]
+    /// Stream-scoped resets are confined to one request stream, so neither
+    /// transport needs to throw anything away: the dead stream is already gone
+    /// and the driver task owns the connection. Kept as an explicit call site so
+    /// the dispatch arms can say "this fault is not connection-level" without
+    /// spelling out the transport.
     pub async fn invalidate_stream_if_same(&self, conn_id: u64) {
         match self {
             Self::H2(c) => c.invalidate_stream_if_same(conn_id).await,
@@ -1791,6 +1810,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_h2_stage_budget_has_floor_and_keeps_the_attempt_bounded() {
+        // 29.9s TCP against a 30s budget leaves TLS ~100ms: the floor restores a
+        // usable window instead of failing a connection that just succeeded.
+        assert_eq!(
+            h2_stage_budget(Duration::ZERO, Duration::from_secs(30)),
+            H2_STAGE_FLOOR
+        );
+        assert_eq!(
+            h2_stage_budget(Duration::from_millis(100), Duration::from_secs(30)),
+            H2_STAGE_FLOOR
+        );
+        // Leftover above the floor is used as-is (no artificial extension).
+        assert_eq!(
+            h2_stage_budget(Duration::from_secs(10), Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        // A deliberately tiny connect_timeout is not inflated past itself.
+        assert_eq!(
+            h2_stage_budget(Duration::ZERO, Duration::from_millis(800)),
+            Duration::from_millis(800)
+        );
+        // Total attempt bound: TCP (connect_timeout) + TLS + h2 handshake, each
+        // floored by min(connect_timeout, H2_STAGE_FLOOR) -> at most 3x budget.
+        let budget = Duration::from_secs(30);
+        let worst = budget + 2 * h2_stage_budget(Duration::ZERO, budget);
+        assert_eq!(worst, Duration::from_secs(34));
+        assert!(worst <= 3 * budget);
+    }
+
     /// Mock h3 server that sends the response head + a first data chunk, then
     /// holds the tail until a permit is released. Used to prove that a
     /// stream-scoped invalidation does not kill a response already in flight.
@@ -1943,6 +1992,74 @@ mod tests {
         }
         assert!(dead, "connection-level invalidation must abort the in-flight stream");
         srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn test_h2_invalidate_stream_if_same_is_a_noop() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_task = tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = match h2::server::handshake(tcp).await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    while let Some(Ok((req, mut respond))) = conn.accept().await {
+                        let mut body = req.into_body();
+                        while let Some(Ok(frame)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(frame.len());
+                        }
+                        let resp = http::Response::builder().status(200).body(()).unwrap();
+                        if let Ok(mut send) = respond.send_response(resp, false) {
+                            let _ = send.send_data(Bytes::from_static(b"h2-ok"), true);
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = H2Client::new(
+            &format!("http://{addr}/v1"),
+            Duration::from_secs(5),
+            Duration::from_secs(0),
+            true,
+        )
+        .unwrap();
+
+        let mk_req = || {
+            http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!("http://{addr}/v1/chat/completions"))
+                .body(Bytes::from_static(b"{}"))
+                .unwrap()
+        };
+
+        let r1 = client.send_stream(mk_req()).await.unwrap();
+        let id1 = r1.conn_id;
+        assert_eq!(
+            r1.body.read_full_limited(1024).await.unwrap().as_ref(),
+            b"h2-ok"
+        );
+
+        // A RST_STREAM is confined to its stream: the pooled connection must
+        // survive with its keepalive task, or every free retry pays a new
+        // TCP+TLS+h2 handshake.
+        client.invalidate_stream_if_same(id1).await;
+        let r2 = client.send_stream(mk_req()).await.unwrap();
+        assert_eq!(r2.conn_id, id1, "stream invalidation must not evict the pool");
+        assert_eq!(
+            r2.body.read_full_limited(1024).await.unwrap().as_ref(),
+            b"h2-ok"
+        );
+
+        // Control: the connection-level path really does evict.
+        client.invalidate_if_same(id1).await;
+        let r3 = client.send_stream(mk_req()).await.unwrap();
+        assert!(r3.conn_id > id1, "connection-level invalidation must redial");
+        let _ = r3.body.read_full_limited(1024).await.unwrap();
+
+        srv_task.abort();
     }
 
     #[tokio::test]
