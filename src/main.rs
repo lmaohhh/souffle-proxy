@@ -2125,10 +2125,14 @@ impl SplicedMessages {
     }
 
     fn estimated_len(&self) -> usize {
-        let inner = self.inner.end - self.inner.start;
-        2 + self.body.get().len() - inner
+        // The client array itself is the dominant term: `map` holds no `messages`
+        // entry when splicing, so omitting it here made the outbound Vec double
+        // once (a full memcpy) on every spliced request -- the copy the splice
+        // exists to avoid.
+        self.body.get().len()
             + self.prefix.as_ref().map_or(0, |p| p.len() + 1)
             + self.suffix.as_ref().map_or(0, |s| s.len() + 1)
+            + 1
     }
 }
 
@@ -6324,6 +6328,37 @@ mod tests {
             patch_serialized_model(&junk, "\"m-b\""),
             ModelPatch::NotFound
         ));
+    }
+
+    #[test]
+    fn spliced_messages_estimated_len_covers_emitted_bytes() {
+        // 100 KB client array + prefix + suffix: the estimate must not collapse to
+        // the ~4 bytes of the old `2 + body - inner` arithmetic, or `with_capacity`
+        // under-allocates and the outbound Vec doubles once per request.
+        let big = "x".repeat(100_000);
+        let body = format!(
+            r#"{{"messages":[{{"role":"user","content":"{big}"}},{{"role":"assistant","content":"ok"}}]}}"#
+        );
+        let prep = r#"{"role":"system","content":"sys"}"#;
+        let app = r#"{"role":"assistant","content":"prefill"}"#;
+        let mut map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(&body).unwrap();
+        let msgs = map.remove("messages").unwrap();
+        let (splice, _, _, _) = plan_messages_splice(msgs, Some(prep), 1, Some(app), 1);
+        let spliced = match splice {
+            MsgsSplice::Spliced(s) => s,
+            MsgsSplice::Verbatim(_) => panic!("expected a splice"),
+        };
+
+        let mut emitted = Vec::new();
+        spliced.emit_into(&mut emitted);
+        assert!(
+            spliced.estimated_len() >= emitted.len(),
+            "estimate {} must cover the {} emitted bytes",
+            spliced.estimated_len(),
+            emitted.len()
+        );
+        // ...and it must not be wildly oversized either (one allocation, no doubling).
+        assert!(spliced.estimated_len() <= emitted.len() + 8);
     }
 
     #[test]
