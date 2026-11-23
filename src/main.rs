@@ -2459,10 +2459,13 @@ fn fold_one_message(elem: &str) -> Option<String> {
             if trimmed.starts_with(FOLD_THINK_OPEN) {
                 return None;
             }
-            let mut s = String::with_capacity(trimmed.len() + rc.len() + 16);
+            // Non-string scalar/object content still folds into a *string*, so the
+            // raw JSON text has to be escaped before it is embedded.
+            let escaped = serde_json::to_string(trimmed).ok()?;
+            let mut s = String::with_capacity(escaped.len() + rc.len() + 16);
             push_think_block(&mut s, rc);
             s.push_str("\\n\\n");
-            s.push_str(trimmed);
+            s.push_str(&escaped[1..escaped.len() - 1]);
             quote_json_string(&s)
         }
     };
@@ -6311,6 +6314,20 @@ mod tests {
             .find(|p| p["type"] == "image_url")
             .expect("image part must not be dropped");
         assert_eq!(media["image_url"]["url"], "https://example.test/cat.png");
+        assert_eq!(parsed[0]["reasoning_content"], "");
+    }
+
+    #[test]
+    fn test_souffle_pout_non_string_content_is_escaped() {
+        // Non-string content still folds into a *string*: the JSON text has to be
+        // escaped when embedded, otherwise the spliced element is invalid JSON.
+        let raw = r#"[{"role":"assistant","content":{"a":1},"reasoning_content":"why"}]"#;
+        let folded = fold_in_content_cot(raw).expect("should fold object content");
+        let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
+        assert_eq!(
+            parsed[0]["content"],
+            format!("{FOLD_THINK_OPEN}\nwhy\n{FOLD_THINK_CLOSE}\n\n{{\"a\":1}}")
+        );
         assert_eq!(parsed[0]["reasoning_content"], "");
     }
 

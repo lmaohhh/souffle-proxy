@@ -22,3 +22,8 @@ Base: `bc587f5`
 - added tests: raw-escape byte-identity (\" \n \u00e9 中文 🦀 \/), plus
   content-key-absent insert path and empty-reasoning_content fallback.
 - gate: `cargo test` 75 passed / 0 failed; clippy clean.
+- found+fixed via differential harness (legacy DOM vs new splice over 25 shapes):
+  non-string `content` (object/number) was spliced unescaped -> invalid JSON -> fold
+  silently disabled. Now escaped through `serde_json::to_string`. Harness removed;
+  regression locked by `test_souffle_pout_non_string_content_is_escaped`.
+- final gate: `cargo test` 77 passed / 0 failed; clippy `-D warnings` clean.
