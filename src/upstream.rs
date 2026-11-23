@@ -31,6 +31,9 @@ pub enum UpstreamError {
     H3StreamReset { error_code: u64 },
     H3GoAway { error_code: u64 },
     H3Protocol(String),
+    /// The request header block exceeds what the peer accepts. Permanent: the
+    /// identical request fails the same way on a fresh connection.
+    HeaderTooBig { actual_size: u64, max_size: u64 },
     Timeout,
     Other(String),
 }
@@ -53,6 +56,13 @@ impl std::fmt::Display for UpstreamError {
                 write!(f, "H3GoAway(error_code={error_code:#x})")
             }
             UpstreamError::H3Protocol(s) => write!(f, "H3Protocol: {s}"),
+            UpstreamError::HeaderTooBig {
+                actual_size,
+                max_size,
+            } => write!(
+                f,
+                "HeaderTooBig: request header block is {actual_size} bytes (peer max {max_size})"
+            ),
             UpstreamError::Timeout => write!(f, "Upstream timeout"),
             UpstreamError::Other(s) => write!(f, "Upstream error: {s}"),
         }
@@ -97,6 +107,33 @@ impl UpstreamError {
                 | Self::H3GoAway { error_code: 0x0107 }
         )
     }
+
+    /// The failure is confined to one request stream; the shared connection is
+    /// still usable. Closing the connection for these aborts every other
+    /// response multiplexed on it (on H3 that is every concurrent request).
+    #[allow(dead_code)]
+    pub fn is_stream_scoped(&self) -> bool {
+        matches!(
+            self,
+            Self::H2StreamReset { .. } | Self::H3StreamReset { .. }
+        )
+    }
+
+    /// The failure means the connection itself is going away (or the request
+    /// never left the socket), so a retry must dial a fresh connection.
+    /// Everything else — notably `HeaderTooBig` — would fail identically on a
+    /// new connection and must be surfaced instead of retried.
+    #[allow(dead_code)]
+    pub fn is_connection_closing(&self) -> bool {
+        match self {
+            Self::Connect(_) | Self::Timeout => true,
+            Self::H2GoAway { .. } | Self::H3GoAway { .. } => true,
+            Self::H2Protocol(_) | Self::H3Protocol(_) => true,
+            Self::H2StreamReset { .. } | Self::H3StreamReset { .. } => false,
+            Self::HeaderTooBig { .. } => false,
+            Self::Other(_) => false,
+        }
+    }
 }
 
 impl From<h2::Error> for UpstreamError {
@@ -131,6 +168,13 @@ impl From<h3::error::StreamError> for UpstreamError {
             h3::error::StreamError::RemoteClosing => {
                 UpstreamError::H3GoAway { error_code: 0x0100 }
             }
+            h3::error::StreamError::HeaderTooBig {
+                actual_size,
+                max_size,
+            } => UpstreamError::HeaderTooBig {
+                actual_size,
+                max_size,
+            },
             h3::error::StreamError::ConnectionError(ce) => ce.into(),
             other => UpstreamError::H3Protocol(format!("{other:?}")),
         }
@@ -603,9 +647,30 @@ impl H2Client {
         }
     }
 
+    /// Stream-scoped failure (RST_STREAM REFUSED_STREAM / CANCEL): the request
+    /// stream is already dead, so the pooled connection is dropped only to get a
+    /// clean socket for the retry. Unlike H3 there is no collateral damage --
+    /// the h2 driver task keeps in-flight streams alive on its own.
+    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
+    #[allow(dead_code)]
+    pub async fn invalidate_stream_if_same(&self, failed_id: u64) {
+        self.invalidate_if_same(failed_id).await;
+    }
+
     async fn connect_raw(&self, target: &Target) -> Result<ActiveConn, UpstreamError> {
+        // ONE deadline for the whole attempt (TCP + TLS + h2 handshake). Applying
+        // connect_timeout to each stage serially let a dead peer hold the
+        // connect_lock for up to 3x the configured budget.
+        let deadline = tokio::time::Instant::now() + self.connect_timeout;
+        let remaining = |deadline: tokio::time::Instant| -> Result<Duration, UpstreamError> {
+            deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(UpstreamError::Timeout)
+        };
+
         let tcp = tokio::time::timeout(
-            self.connect_timeout,
+            remaining(deadline)?,
             tokio::net::TcpStream::connect((target.sni_host(), target.port)),
         )
         .await
@@ -624,7 +689,7 @@ impl H2Client {
                 .to_owned();
 
             let tls =
-                tokio::time::timeout(self.connect_timeout, connector.connect(server_name, tcp))
+                tokio::time::timeout(remaining(deadline)?, connector.connect(server_name, tcp))
                     .await
                     .map_err(|_| UpstreamError::Timeout)?
                     .map_err(UpstreamError::Connect)?;
@@ -645,7 +710,7 @@ impl H2Client {
         let builder = h2::client::Builder::new();
 
         let (send_req, connection) =
-            tokio::time::timeout(self.connect_timeout, builder.handshake(stream))
+            tokio::time::timeout(remaining(deadline)?, builder.handshake(stream))
                 .await
                 .map_err(|_| UpstreamError::Timeout)?
                 .map_err(UpstreamError::from)?;
@@ -911,6 +976,18 @@ fn bind_h3_endpoint(is_ipv6: bool) -> Result<quinn::Endpoint, UpstreamError> {
     .map_err(|e| UpstreamError::Connect(std::io::Error::other(e)))
 }
 
+/// Floor for the post-QUIC h3 control handshake. DNS + the QUIC handshake can
+/// consume the whole connect budget, which used to leave this handshake with a
+/// ~0s timeout and fail a connection whose QUIC handshake had just succeeded.
+const H3_HANDSHAKE_FLOOR: Duration = Duration::from_secs(2);
+
+/// Timeout for the h3 control handshake: whatever is left of the connect
+/// budget, but never less than a bounded floor (itself capped by
+/// `connect_timeout`, so a deliberately tiny budget stays tiny).
+fn h3_handshake_budget(remaining: Duration, connect_timeout: Duration) -> Duration {
+    remaining.max(connect_timeout.min(H3_HANDSHAKE_FLOOR))
+}
+
 #[derive(Clone)]
 pub struct H3Client {
     pub targets: Arc<Vec<Target>>,
@@ -1037,10 +1114,24 @@ impl H3Client {
         }
     }
 
+    /// Stream-scoped failure (H3_REQUEST_REJECTED / H3_REQUEST_CANCELLED /
+    /// H3_EXCESSIVE_LOAD, or any first-chunk stream reset): the request stream
+    /// is already dead and needs no cleanup, and the pooled QUIC connection is
+    /// still healthy for everyone else on it. Tearing the connection down here
+    /// would abort every concurrent response multiplexed onto it -- one
+    /// request's retryable reset would take out the whole in-flight batch.
+    /// Callers must use `invalidate_if_same` only for connection-level faults.
+    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
+    #[allow(dead_code)]
+    pub async fn invalidate_stream_if_same(&self, _failed_id: u64) {}
+
     async fn connect_raw(&self, target: &Target) -> Result<ActiveH3Conn, UpstreamError> {
         let deadline = tokio::time::Instant::now() + self.connect_timeout;
         let resolved: Vec<std::net::SocketAddr> = tokio::time::timeout(
-            self.connect_timeout,
+            deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .filter(|d| !d.is_zero())
+                .ok_or(UpstreamError::Timeout)?,
             tokio::net::lookup_host((target.sni_host(), target.port)),
         )
         .await
@@ -1126,7 +1217,12 @@ impl H3Client {
         let mut client_builder = h3::client::builder();
         client_builder.send_grease(false);
 
-        let h3_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
+        // The h3 control handshake is an extra RTT after the QUIC handshake; give
+        // it its own bounded window instead of whatever DNS + QUIC left over.
+        let h3_budget = h3_handshake_budget(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            self.connect_timeout,
+        );
         let (mut driver, send_req) =
             tokio::time::timeout(h3_budget, client_builder.build(quinn_conn))
                 .await
@@ -1241,7 +1337,18 @@ impl H3Client {
             .await
         {
             Ok(s) => s,
-            Err(_) => {
+            Err(e) => {
+                let first_err = UpstreamError::from(e);
+                // Only a dying connection is worth a second attempt. A permanent
+                // request fault (HeaderTooBig, local protocol violation) would
+                // fail identically on a fresh connection and its real error must
+                // reach the caller instead of being replaced by the retry's.
+                if !first_err.is_connection_closing() {
+                    return Err(UpstreamSendError {
+                        error: first_err,
+                        conn_id: Some(conn.id),
+                    });
+                }
                 self.invalidate_if_same(conn.id).await;
                 let fresh = self
                     .get_connection()
@@ -1328,6 +1435,20 @@ impl UpstreamClient {
         match self {
             Self::H2(c) => c.invalidate_if_same(conn_id).await,
             Self::H3(c) => c.invalidate_if_same(conn_id).await,
+        }
+    }
+
+    /// Connection-level invalidation is only correct for faults that affect the
+    /// whole connection (GOAWAY, protocol error, connect failure, TTFT wedge).
+    /// Stream-scoped resets must go through here instead: on H3 they leave the
+    /// shared QUIC connection healthy, and tearing it down would abort every
+    /// other response multiplexed on it.
+    // caller wiring in main.rs's stream-reset arms lands in the dispatch slice
+    #[allow(dead_code)]
+    pub async fn invalidate_stream_if_same(&self, conn_id: u64) {
+        match self {
+            Self::H2(c) => c.invalidate_stream_if_same(conn_id).await,
+            Self::H3(c) => c.invalidate_stream_if_same(conn_id).await,
         }
     }
 
@@ -1609,6 +1730,223 @@ mod tests {
             }
         });
         (local_addr, handle)
+    }
+
+    #[test]
+    fn test_error_classification_stream_scoped_vs_connection_closing() {
+        // Stream resets are confined to their own request stream: H3_REQUEST_REJECTED,
+        // H3_REQUEST_CANCELLED and H3_EXCESSIVE_LOAD all keep the QUIC connection pooled.
+        for code in [0x010b_u64, 0x010c, 0x0107] {
+            let e = UpstreamError::H3StreamReset { error_code: code };
+            assert!(e.is_stream_scoped(), "H3 reset {code:#x} must be stream-scoped");
+            assert!(
+                !e.is_connection_closing(),
+                "H3 reset {code:#x} must not force a reconnect"
+            );
+        }
+        for code in [7_u32, 8, 2] {
+            let e = UpstreamError::H2StreamReset { error_code: code };
+            assert!(e.is_stream_scoped());
+            assert!(!e.is_connection_closing());
+        }
+
+        // Genuine connection-level faults still tear the pool down.
+        let conn_errors = [
+            UpstreamError::Connect(std::io::Error::other("boom")),
+            UpstreamError::Timeout,
+            UpstreamError::H2Protocol("bad frame".into()),
+            UpstreamError::H3Protocol("bad frame".into()),
+            UpstreamError::H2GoAway { error_code: 0 },
+            UpstreamError::H3GoAway { error_code: 0x0100 },
+            UpstreamError::H3GoAway { error_code: 0x0107 },
+        ];
+        for e in conn_errors {
+            assert!(e.is_connection_closing(), "{e} must force a reconnect");
+            assert!(!e.is_stream_scoped(), "{e} must not take the stream path");
+        }
+
+        // HeaderTooBig is permanent: never retried, never mistaken for a dead conn.
+        let too_big = UpstreamError::HeaderTooBig {
+            actual_size: 100_000,
+            max_size: 16_384,
+        };
+        assert!(!too_big.is_connection_closing());
+        assert!(!too_big.is_stream_scoped());
+        let msg = too_big.to_string();
+        assert!(msg.contains("100000") && msg.contains("16384"), "{msg}");
+    }
+
+    #[test]
+    fn test_h3_handshake_budget_has_floor_and_stays_bounded() {
+        // DNS + QUIC ate the whole budget: the h3 control handshake still gets a window.
+        assert_eq!(
+            h3_handshake_budget(Duration::ZERO, Duration::from_secs(30)),
+            H3_HANDSHAKE_FLOOR
+        );
+        // Leftover above the floor is used as-is (no artificial extension).
+        assert_eq!(
+            h3_handshake_budget(Duration::from_secs(10), Duration::from_secs(30)),
+            Duration::from_secs(10)
+        );
+        // A deliberately tiny connect_timeout is not inflated past itself.
+        assert_eq!(
+            h3_handshake_budget(Duration::ZERO, Duration::from_millis(800)),
+            Duration::from_millis(800)
+        );
+    }
+
+    /// Mock h3 server that sends the response head + a first data chunk, then
+    /// holds the tail until a permit is released. Used to prove that a
+    /// stream-scoped invalidation does not kill a response already in flight.
+    async fn spawn_mock_h3_holding_server(
+        bind_addr: std::net::SocketAddr,
+        gate: Arc<tokio::sync::Semaphore>,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let cert = rustls::pki_types::CertificateDer::from(TEST_CERT_DER);
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(TEST_KEY_DER.into());
+        let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
+        let quic_srv_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg).unwrap(),
+        ));
+        let endpoint = quinn::Endpoint::server(quic_srv_cfg, bind_addr).unwrap();
+        let local_addr = endpoint.local_addr().unwrap();
+
+        let handle = tokio::spawn(async move {
+            while let Some(incoming) = endpoint.accept().await {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    let conn = match incoming.await {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
+                    let mut h3_conn =
+                        match h3::server::Connection::new(h3_quinn::Connection::new(conn)).await {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                    while let Ok(Some(resolver)) = h3_conn.accept().await {
+                        let gate = gate.clone();
+                        tokio::spawn(async move {
+                            if let Ok((_req, mut stream)) = resolver.resolve_request().await {
+                                while let Ok(Some(_)) = stream.recv_data().await {}
+                                let resp =
+                                    http::Response::builder().status(200).body(()).unwrap();
+                                if stream.send_response(resp).await.is_ok() {
+                                    let _ = stream.send_data(Bytes::from_static(b"h3-part1")).await;
+                                    let _ = gate.acquire().await;
+                                    let _ = stream.send_data(Bytes::from_static(b"h3-part2")).await;
+                                    let _ = stream.finish().await;
+                                }
+                            }
+                        });
+                    }
+                });
+            }
+        });
+        (local_addr, handle)
+    }
+
+    #[tokio::test]
+    async fn test_h3_stream_invalidation_preserves_concurrent_response() {
+        use futures_util::StreamExt;
+
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let (addr, srv) =
+            spawn_mock_h3_holding_server("127.0.0.1:0".parse().unwrap(), gate.clone()).await;
+        let client = H3Client::new(
+            &format!("https://127.0.0.1:{}/v1", addr.port()),
+            Duration::from_secs(5),
+            true,
+        )
+        .unwrap();
+        let mk_req = || {
+            http::Request::builder()
+                .method(http::Method::POST)
+                .uri(format!(
+                    "https://127.0.0.1:{}/v1/chat/completions",
+                    addr.port()
+                ))
+                .body(Bytes::from_static(b"{}"))
+                .unwrap()
+        };
+
+        let mut held = client.send_stream(mk_req()).await.unwrap();
+        let conn_id = held.conn_id;
+        let first = held.body.next().await.unwrap().unwrap();
+        assert_eq!(first.as_ref(), b"h3-part1");
+
+        // A stream-scoped failure (H3_REQUEST_REJECTED etc.) for this very
+        // connection must leave the pooled QUIC connection alone: the response
+        // already in flight on it has to survive.
+        client.invalidate_stream_if_same(conn_id).await;
+        gate.add_permits(1);
+
+        let mut rest = Vec::new();
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), held.body.next()).await {
+                Ok(Some(Ok(chunk))) => rest.extend_from_slice(&chunk),
+                Ok(Some(Err(e))) => panic!("in-flight response destroyed by stream invalidation: {e}"),
+                Ok(None) => break,
+                Err(_) => panic!("in-flight response stalled: the QUIC connection was closed"),
+            }
+        }
+        assert_eq!(rest.as_slice(), b"h3-part2");
+
+        // The connection is still pooled and reused, not redialed.
+        let follow = client.send_stream(mk_req()).await.unwrap();
+        assert_eq!(follow.conn_id, conn_id, "stream invalidation must not evict the pool");
+        srv.abort();
+
+        // Control: the connection-level path (kept for genuine connection
+        // faults) really does tear the pool down and kill in-flight responses,
+        // which is exactly why stream resets must not use it.
+        let gate2 = Arc::new(tokio::sync::Semaphore::new(0));
+        let (addr2, srv2) =
+            spawn_mock_h3_holding_server("127.0.0.1:0".parse().unwrap(), gate2.clone()).await;
+        let client2 = H3Client::new(
+            &format!("https://127.0.0.1:{}/v1", addr2.port()),
+            Duration::from_secs(5),
+            true,
+        )
+        .unwrap();
+        let mut held2 = client2
+            .send_stream(
+                http::Request::builder()
+                    .method(http::Method::POST)
+                    .uri(format!(
+                        "https://127.0.0.1:{}/v1/chat/completions",
+                        addr2.port()
+                    ))
+                    .body(Bytes::from_static(b"{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let id2 = held2.conn_id;
+        let _ = held2.body.next().await.unwrap().unwrap();
+        client2.invalidate_if_same(id2).await;
+        gate2.add_permits(1);
+        let mut dead = false;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), held2.body.next()).await {
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(_))) | Err(_) => {
+                    dead = true;
+                    break;
+                }
+                Ok(None) => break,
+            }
+        }
+        assert!(dead, "connection-level invalidation must abort the in-flight stream");
+        srv2.abort();
     }
 
     #[tokio::test]
