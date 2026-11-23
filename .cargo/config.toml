@@ -1,2 +1,7 @@
 [build]
 rustflags = ["-C", "target-cpu=native"]
+
+# rust-lld instead of MSVC link.exe: faster link, and it sidesteps the MSYS
+# coreutils `link.exe` that shadows MSVC's linker on this box.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"

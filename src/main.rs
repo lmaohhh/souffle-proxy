@@ -493,6 +493,7 @@ impl Config {
         let max_concurrency = env::var("SOUFFLE_MAX_CONCURRENCY")
             .ok()
             .and_then(|c| c.parse().ok())
+            .filter(|&n| n >= 1)
             .unwrap_or(20);
         let connect_timeout = env_timeout("SOUFFLE_CONNECT_TIMEOUT", 30.0);
         if env::var("SOUFFLE_WRITE_TIMEOUT").is_ok() {
@@ -507,6 +508,7 @@ impl Config {
         let max_retry = env::var("SOUFFLE_MAX_RETRY")
             .ok()
             .and_then(|v| v.parse().ok())
+            .filter(|&n| n >= 1)
             .unwrap_or(15);
         let max_body_bytes = env::var("SOUFFLE_MAX_BODY_BYTES")
             .ok()
@@ -1292,6 +1294,58 @@ impl<'a> BufferedResponse<'a> {
     }
 }
 
+/// Extract the trailing `usage` object of a buffered completion without parsing the
+/// whole document. Falls back to `None` on any unexpected shape, so the caller can
+/// still do a full parse; the point is that the common case never pays for one.
+fn extract_usage_from_body_tail(body: &[u8]) -> Option<UsageStats> {
+    const TAIL: usize = 8192;
+    let window = &body[body.len().saturating_sub(TAIL)..];
+    let mut i = memchr::memmem::rfind(window, b"\"usage\"")? + b"\"usage\"".len();
+    while i < window.len() && window[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if window.get(i) != Some(&b':') {
+        return None;
+    }
+    i += 1;
+    while i < window.len() && window[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if window.get(i) != Some(&b'{') {
+        return None;
+    }
+    let obj_start = i;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    while i < window.len() {
+        let c = window[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return serde_json::from_slice::<UsageStats>(&window[obj_start..=i]).ok();
+                    }
+                }
+                _ => {}
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 fn extract_usage_from_sse_line(line: &str) -> Option<UsageStats> {
     let data_str = line.trim().strip_prefix("data:")?.trim();
     if data_str.is_empty() || data_str == "[DONE]" {
@@ -1368,10 +1422,9 @@ fn make_json_response(status: StatusCode, body: Value) -> Response {
 }
 
 fn make_text_response(status: StatusCode, text: &str) -> Response {
-    let mut resp = text.to_string().into_response();
-    *resp.status_mut() = status;
-    apply_nocache_headers(resp.headers_mut());
-    resp
+    // Every caller is a failure path. Emit the OpenAI error envelope rather than
+    // text/plain: SDKs parse {"error":{...}} and report decode errors otherwise.
+    make_error_response(status, text)
 }
 
 fn make_error_response(status: StatusCode, msg: &str) -> Response {
@@ -1379,7 +1432,7 @@ fn make_error_response(status: StatusCode, msg: &str) -> Response {
         "error": {
             "message": msg,
             "type": "proxy_error",
-            "code": status.as_str(),
+            "code": status.as_u16().to_string(),
         }
     });
     make_json_response(status, err_json)
@@ -1495,6 +1548,8 @@ impl Drop for ActiveRequestGuard {
 /// than this is pointless -- and an unbounded read would let a broken upstream exhaust
 /// memory. Caps both the retry-preview read and the final error-body read.
 const ERROR_BODY_CAP: usize = 64 * 1024;
+/// A stalled upstream that already sent error headers must not hang the request.
+const ERROR_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 
 async fn handle_chat_completions(State(state): State<Arc<AppState>>, request: Request) -> Response {
     let req_id = format!("{:08x}", fastrand::u32(..));
@@ -2076,13 +2131,38 @@ fn fold_in_content_cot(msgs_raw: &str) -> Option<Box<RawValue>> {
             }
         };
 
-        msg.insert("content".to_string(), Value::String(new_content));
+        // Rebuild structured content instead of flattening it: folding must not drop
+        // non-text parts (image_url, input_audio, ...). Text parts are already inside
+        // new_content; everything else is carried over verbatim.
+        let existing_array = msg.get("content").and_then(Value::as_array).cloned();
+        match existing_array {
+            Some(arr) => {
+                let mut media: Vec<Value> = Vec::new();
+                for part in arr {
+                    let is_text = part.is_string() || part.get("text").is_some();
+                    if !is_text {
+                        media.push(part);
+                    }
+                }
+                let mut parts = vec![json!({"type": "text", "text": new_content})];
+                parts.append(&mut media);
+                msg.insert("content".to_string(), Value::Array(parts));
+            }
+            None => {
+                msg.insert("content".to_string(), Value::String(new_content));
+            }
+        }
 
         // 7. Schema normalization: set "reasoning_content": "" (and "reasoning": "" if present)
-        msg.insert(
-            "reasoning_content".to_string(),
-            Value::String(String::new()),
-        );
+        // Normalize only keys the message actually carried: injecting an empty
+        // reasoning_content into a message that never had one can trip strict
+        // OpenAI-compatible schema validators.
+        if msg.contains_key("reasoning_content") {
+            msg.insert(
+                "reasoning_content".to_string(),
+                Value::String(String::new()),
+            );
+        }
         if msg.contains_key("reasoning") {
             msg.insert("reasoning".to_string(), Value::String(String::new()));
         }
@@ -2504,14 +2584,18 @@ async fn dispatch_upstream(
                     || status_u16 == 529)
                     && attempt < preset.config.max_retry - 1
                 {
-                    let err_preview =
-                        match upstream_resp.body.read_full_limited(ERROR_BODY_CAP).await {
-                            Ok(b) => {
-                                let s = String::from_utf8_lossy(&b);
-                                s.chars().take(200).collect::<String>()
-                            }
-                            Err(_) => String::from("<unable to read body>"),
-                        };
+                    let err_preview = match tokio::time::timeout(
+                        ERROR_BODY_TIMEOUT,
+                        upstream_resp.body.read_full_limited(ERROR_BODY_CAP),
+                    )
+                    .await
+                    {
+                        Ok(Ok(b)) => {
+                            let s = String::from_utf8_lossy(&b);
+                            s.chars().take(200).collect::<String>()
+                        }
+                        _ => String::from("<unable to read body>"),
+                    };
                     log(
                         &format!("Upstream HTTP {}: {}", status_u16, err_preview),
                         Some(&req_id),
@@ -2528,11 +2612,14 @@ async fn dispatch_upstream(
 
                 // If fatal error >= 400
                 if status_u16 >= 400 {
-                    let err_body = upstream_resp
-                        .body
-                        .read_full_limited(ERROR_BODY_CAP)
-                        .await
-                        .unwrap_or_default();
+                    let err_body = tokio::time::timeout(
+                        ERROR_BODY_TIMEOUT,
+                        upstream_resp.body.read_full_limited(ERROR_BODY_CAP),
+                    )
+                    .await
+                    .ok()
+                    .and_then(|r| r.ok())
+                    .unwrap_or_default();
                     let s = String::from_utf8_lossy(&err_body);
                     let preview = s.chars().take(500).collect::<String>();
                     // Cloudflare's edge codes (520-527) are non-standard and carry an HTML
@@ -2873,11 +2960,11 @@ async fn dispatch_upstream(
                 } else {
                     // Non-stream: read the whole body here (bounded) so the
                     // degenerate-output classifier can veto before we answer.
-                    let body_bytes = match tokio::time::timeout(
+                    let (body_bytes, body_truncated) = match tokio::time::timeout(
                         preset.config.read_timeout,
                         upstream_resp
                             .body
-                            .read_full_limited(preset.config.max_body_bytes),
+                            .read_full_limited_checked(preset.config.max_body_bytes),
                     )
                     .await
                     {
@@ -2926,7 +3013,29 @@ async fn dispatch_upstream(
                             );
                         }
                     };
-                    let parsed_buffered = serde_json::from_slice::<BufferedResponse>(&body_bytes).ok();
+                    if body_truncated {
+                        // Never forward a cut-off payload as a 200: the client would try to
+                        // parse half a JSON document and report a decode error.
+                        state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                        log(
+                            &format!(
+                                "Upstream body exceeded max_body_bytes ({}); returning 502 instead of a truncated 200",
+                                preset.config.max_body_bytes
+                            ),
+                            Some(&req_id),
+                        );
+                        return make_error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "Upstream response exceeded max_body_bytes",
+                        );
+                    }
+                    let parsed_buffered = if preset.config.degen_repeat {
+                        serde_json::from_slice::<BufferedResponse>(&body_bytes).ok()
+                    } else {
+                        // No classifier to run: do not build a typed view of the whole
+                        // response just to read its trailing usage object.
+                        None
+                    };
                     if preset.config.degen_repeat
                         && parsed_buffered
                             .as_ref()
@@ -2961,7 +3070,14 @@ async fn dispatch_upstream(
                             return make_json_response(StatusCode::BAD_GATEWAY, err_json);
                         }
                     }
-                    let usage = parsed_buffered.and_then(|p| p.extract_usage());
+                    let usage = parsed_buffered
+                        .and_then(|p| p.extract_usage())
+                        .or_else(|| extract_usage_from_body_tail(&body_bytes))
+                        .or_else(|| {
+                            serde_json::from_slice::<BufferedResponse>(&body_bytes)
+                                .ok()
+                                .and_then(|p| p.extract_usage())
+                        });
                     return buffer_response(
                         upstream_status,
                         upstream_headers,
@@ -3125,6 +3241,10 @@ async fn dispatch_upstream(
                     ),
                     Some(&req_id),
                 );
+                // A TTFT timeout means the pooled connection may be wedged while still
+                // reporting ready; drop it so the retry dials fresh (mirrors the
+                // Ok(Err) branch, which invalidates on transport failure).
+                preset.client.invalidate_connection().await;
                 if attempt < preset.config.max_retry - 1 {
                     let delay = retry_delay(attempt);
                     log(
@@ -3951,7 +4071,10 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
     let path = config_json_path();
     let mut root: Value = if path.is_file() {
         let txt = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&txt).unwrap_or_else(|_| json!({}))
+        // Never treat an unparsable operator file as empty: rebuilding it from {}
+        // would silently drop every preset the operator had configured.
+        serde_json::from_str(&txt)
+            .map_err(|e| format!("refusing to rewrite unparsable {}: {e}", path.display()))?
     } else {
         json!({})
     };
@@ -3964,21 +4087,27 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
     if !presets.is_object() {
         *presets = json!({});
     }
-    let mut preset_obj = json!({
-        "name": preset.name,
-        "model": if preset.models.len() == 1 {
-            json!(preset.models[0])
-        } else {
-            json!(preset.models)
-        },
-        "key_env": if preset.key_envs.len() == 1 {
-            json!(preset.key_envs[0])
-        } else {
-            json!(preset.key_envs)
-        },
-        "upstream_bases": preset.upstream_bases,
-        "inject": Value::Object(preset.inject.clone()),
-    });
+    // Seed from any existing entry so fields this questionnaire does not edit
+    // (brotli, http3, souffle_pout, degen_repeat, alias) survive a re-save.
+    let mut preset_obj = presets
+        .as_object()
+        .and_then(|m| m.get(&preset.name))
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    preset_obj["name"] = json!(preset.name);
+    preset_obj["model"] = if preset.models.len() == 1 {
+        json!(preset.models[0])
+    } else {
+        json!(preset.models)
+    };
+    preset_obj["key_env"] = if preset.key_envs.len() == 1 {
+        json!(preset.key_envs[0])
+    } else {
+        json!(preset.key_envs)
+    };
+    preset_obj["upstream_bases"] = json!(preset.upstream_bases);
+    preset_obj["inject"] = Value::Object(preset.inject.clone());
     if !preset.append_messages.is_empty() {
         preset_obj["append_messages"] = json!(preset.append_messages);
     }
@@ -3990,7 +4119,21 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
         .unwrap()
         .insert(preset.name.clone(), preset_obj);
     let pretty = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
-    std::fs::write(&path, pretty).map_err(|e| e.to_string())?;
+    // Atomic replace: a crash, panic=abort or full disk mid-write must never leave
+    // a truncated config.json behind - the next start would die parsing it.
+    let tmp = path.with_extension("json.tmp");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)
+            .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+        f.write_all(pretty.as_bytes())
+            .and_then(|_| f.sync_all())
+            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    }
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("rename {} -> {}: {e}", tmp.display(), path.display())
+    })?;
     Ok(())
 }
 
@@ -4489,25 +4632,20 @@ async fn main() {
     let mut rx1 = shutdown_rx.clone();
     let axum_shutdown = async move {
         let _ = rx1.wait_for(|&v| v).await;
-    };
-
-    let mut rx2 = shutdown_rx.clone();
-    let drain_timeout = async move {
-        let _ = rx2.wait_for(|&v| v).await;
-        tokio::time::sleep(tokio::time::Duration::from_millis(1500)).await;
         log(
-            "Graceful drain window (1.5s) completed, closing server.",
+            "Shutdown signal received: no longer accepting; waiting for in-flight requests (close the window to force-exit).",
             None,
         );
     };
 
-    tokio::select! {
-        res = axum::serve(listener, app).with_graceful_shutdown(axum_shutdown) => {
-            if let Err(e) = res {
-                eprintln!("[FATAL] Server error: {}", e);
-            }
-        }
-        _ = drain_timeout => {}
+    // Await the server instead of racing it against a fixed timer. The old
+    // 1.5 s window dropped axum::serve and cut live SSE streams mid-body while
+    // logging that the drain had "completed".
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(axum_shutdown)
+        .await
+    {
+        eprintln!("[FATAL] Server error: {}", e);
     }
 
     // Let the log writer drain before the process exits (the writer thread is a
@@ -5731,7 +5869,10 @@ mod tests {
             "<think>\nCalculating deep thought...\n</think>\n\n42 is the answer."
         );
         assert_eq!(parsed[0]["reasoning"], "");
-        assert_eq!(parsed[0]["reasoning_content"], "");
+        assert!(
+            parsed[0].get("reasoning_content").is_none(),
+            "folding must not inject reasoning_content into a message that never carried it"
+        );
     }
 
     #[test]
@@ -5834,6 +5975,7 @@ mod tests {
                 "role": "assistant",
                 "content": [
                     {"type": "text", "text": "Part 1 of message. "},
+                    {"type": "image_url", "image_url": {"url": "https://example.test/cat.png"}},
                     {"type": "text", "text": "Part 2 of message."}
                 ],
                 "reasoning_content": "Multi-modal analysis"
@@ -5843,10 +5985,19 @@ mod tests {
 
         let folded = fold_in_content_cot(&raw).expect("should fold array content");
         let parsed: Vec<Value> = serde_json::from_str(folded.get()).unwrap();
-        assert_eq!(
-            parsed[0]["content"],
-            "<think>\nMulti-modal analysis\n</think>\n\nPart 1 of message. Part 2 of message."
-        );
+        let parts = parsed[0]["content"]
+            .as_array()
+            .expect("array content must stay structured after folding");
+        assert_eq!(parts[0]["type"], "text");
+        let text = parts[0]["text"].as_str().unwrap();
+        assert!(text.contains("Multi-modal analysis"));
+        assert!(text.ends_with("Part 1 of message. Part 2 of message."));
+        // Regression: non-text parts must survive folding verbatim.
+        let media = parts
+            .iter()
+            .find(|p| p["type"] == "image_url")
+            .expect("image part must not be dropped");
+        assert_eq!(media["image_url"]["url"], "https://example.test/cat.png");
         assert_eq!(parsed[0]["reasoning_content"], "");
     }
 

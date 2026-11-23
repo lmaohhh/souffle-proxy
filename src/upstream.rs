@@ -291,21 +291,34 @@ impl BodyStream {
     /// Read the body but stop once `max` bytes are buffered. Callers that only ever
     /// read a short preview use this so a misbehaving upstream cannot grow the buffer
     /// without bound. Returns what it got; truncation is not an error.
-    pub async fn read_full_limited(mut self, max: usize) -> Result<Bytes, UpstreamError> {
+    pub async fn read_full_limited(self, max: usize) -> Result<Bytes, UpstreamError> {
+        self.read_full_limited_checked(max).await.map(|(b, _)| b)
+    }
+
+    /// Same read, but reports whether the cap was reached while data remained, so a
+    /// caller that forwards the body can fail loudly instead of shipping a truncated
+    /// payload as a 200. Preview callers keep using `read_full_limited`.
+    pub async fn read_full_limited_checked(
+        mut self,
+        max: usize,
+    ) -> Result<(Bytes, bool), UpstreamError> {
         let mut buf = bytes::BytesMut::with_capacity(max.min(8192));
+        let mut truncated = false;
         while let Some(chunk_res) = futures_util::StreamExt::next(&mut self).await {
             let chunk = chunk_res?;
             let room = max.saturating_sub(buf.len());
             if room == 0 {
+                truncated = true;
                 break;
             }
             if chunk.len() > room {
                 buf.extend_from_slice(&chunk[..room]);
+                truncated = true;
                 break;
             }
             buf.extend_from_slice(&chunk);
         }
-        Ok(buf.freeze())
+        Ok((buf.freeze(), truncated))
     }
 }
 
