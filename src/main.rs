@@ -1920,6 +1920,154 @@ fn scan_json_array(s: &str) -> Option<ArrayScan<'_>> {
     None
 }
 
+/// End offset (one past the closing quote) of the JSON string literal starting at `i`.
+/// Escape-aware: `\\` and `\"` never terminate the literal.
+fn scan_json_string_end(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if bytes.get(i) != Some(&b'"') {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() {
+        let pos = memchr::memchr2(b'"', b'\\', &bytes[i..])?;
+        let hit = i + pos;
+        if bytes[hit] == b'"' {
+            return Some(hit + 1);
+        }
+        // Escaped byte: skipping two is safe even for \uXXXX (hex digits
+        // are never a quote or a backslash).
+        i = hit + 2;
+    }
+    None
+}
+
+/// End offset (one past the last byte) of the JSON value starting at `i`.
+fn scan_json_value_end(bytes: &[u8], i: usize) -> Option<usize> {
+    match *bytes.get(i)? {
+        b'"' => scan_json_string_end(bytes, i),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b'"' => {
+                        j = scan_json_string_end(bytes, j)?;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth = depth.saturating_sub(1);
+                        if depth == 0 {
+                            return Some(j + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+            None
+        }
+        _ => {
+            // Scalar (number/true/false/null): ends at a structural byte.
+            let mut j = i;
+            while j < bytes.len() {
+                match bytes[j] {
+                    b',' | b'}' | b']' => return Some(j),
+                    b if b.is_ascii_whitespace() => return Some(j),
+                    _ => j += 1,
+                }
+            }
+            Some(bytes.len())
+        }
+    }
+}
+
+/// Byte span `[start, end)` of a top-level object member's value.
+/// Only depth-1 members are examined, so nested `"model"` keys can't match.
+fn find_top_level_value_span(bytes: &[u8], key: &str) -> Option<(usize, usize)> {
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    loop {
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b'"') {
+            return None;
+        }
+        let key_start = i;
+        let key_end = scan_json_string_end(bytes, i)?;
+        let raw_key = &bytes[key_start + 1..key_end - 1];
+        let key_matches = raw_key == key.as_bytes()
+            || (raw_key.contains(&b'\\')
+                && std::str::from_utf8(&bytes[key_start..key_end])
+                    .ok()
+                    .and_then(|s| serde_json::from_str::<String>(s).ok())
+                    .is_some_and(|s| s == key));
+        i = key_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let value_start = i;
+        let value_end = scan_json_value_end(bytes, i)?;
+        if key_matches {
+            return Some((value_start, value_end));
+        }
+        i = value_end;
+        while i < len && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if bytes.get(i) != Some(&b',') {
+            return None;
+        }
+        i += 1;
+    }
+}
+
+/// Outcome of swapping the top-level `"model"` literal in a serialized body.
+enum ModelPatch {
+    /// The body already carries this exact literal: nothing to rewrite.
+    Unchanged,
+    /// Body rebuilt with the new literal.
+    Replaced(Bytes),
+    /// `model` not found (or malformed body): caller must re-serialize.
+    NotFound,
+}
+
+/// Swap the top-level `"model"` value span inside an already-serialized body.
+///
+/// Byte-identical to re-serializing the whole payload map: top-level keys are
+/// emitted in `BTreeMap` order and the model value is a pre-serialized raw
+/// literal, so a model rotation can only move that one span. One memcpy beats
+/// re-serializing (and re-brotli'ing) multi-MB JSON while a permit is held.
+fn patch_serialized_model(body: &Bytes, model_raw: &str) -> ModelPatch {
+    let Some((value_start, value_end)) = find_top_level_value_span(body, "model") else {
+        return ModelPatch::NotFound;
+    };
+    let current = &body[value_start..value_end];
+    let new_literal = model_raw.as_bytes();
+    if current == new_literal {
+        return ModelPatch::Unchanged;
+    }
+    let mut out = BytesMut::with_capacity(body.len() - current.len() + new_literal.len());
+    out.extend_from_slice(&body[..value_start]);
+    out.extend_from_slice(new_literal);
+    out.extend_from_slice(&body[value_end..]);
+    ModelPatch::Replaced(out.freeze())
+}
+
 #[derive(serde::Deserialize)]
 struct RoleCheck<'a> {
     #[serde(borrow, default)]
@@ -2454,8 +2602,8 @@ async fn dispatch_upstream(
         }
     };
 
-    // Compress the outbound body once; recomputed only when a multi-model
-    // retry re-serializes the payload below.
+    // Compress the outbound body once; retries only patch the model literal,
+    // so a re-encode happens only when that literal really changed.
     let mut outbound = prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
 
     let send_timeout = preset.config.read_timeout;
@@ -2475,13 +2623,36 @@ async fn dispatch_upstream(
                 preset.model_index.fetch_add(1, Ordering::Relaxed) % preset.config.models.len();
             let next_model = &preset.config.models[next_idx];
             let next_model_raw = &preset.config.models_raw[next_idx];
-            payload.rewrite_model(next_model_raw);
-            let mut buf = Vec::with_capacity(payload.estimated_capacity(cot_active));
-            if payload.serialize_into(&mut buf).is_ok() {
-                payload_bytes = Bytes::from(buf);
+            // A rotation only swaps the top-level model literal, so splice that
+            // span in the already-serialized body instead of re-serializing (and
+            // re-brotli'ing) multi-MB JSON on every retry under the permit.
+            match patch_serialized_model(&payload_bytes, next_model_raw.get()) {
+                ModelPatch::Unchanged => {}
+                ModelPatch::Replaced(patched) => {
+                    payload_bytes = patched;
+                    // Brotli output is content-dependent, so a changed literal
+                    // always invalidates it (identical literals took the
+                    // Unchanged arm above and keep the old encode).
+                    outbound = if preset.config.brotli_enabled {
+                        prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await
+                    } else {
+                        OutboundBody {
+                            bytes: payload_bytes.clone(),
+                            is_brotli: false,
+                        }
+                    };
+                }
+                // Body shape not recognized: fall back to a full re-serialize.
+                ModelPatch::NotFound => {
+                    payload.rewrite_model(next_model_raw);
+                    let mut buf = Vec::with_capacity(payload.estimated_capacity(cot_active));
+                    if payload.serialize_into(&mut buf).is_ok() {
+                        payload_bytes = Bytes::from(buf);
+                        outbound =
+                            prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
+                    }
+                }
             }
-            // The rotated payload is a different serialization: recompress.
-            outbound = prep_outbound_body(&preset.config, payload_bytes.clone(), &req_id).await;
             log(
                 &format!(
                     "Retrying attempt {}/{} with alternative model: {} (preset '{}', model {}/{})",
@@ -5624,6 +5795,77 @@ mod tests {
         assert!(String::from_utf8(buf_verbatim)
             .unwrap()
             .contains(r#""\u0041""#));
+    }
+
+    #[test]
+    fn retry_model_patch_is_byte_identical_to_full_reserialize() {
+        // Client body whose messages embed an escaped `"model"` key: the patch
+        // scanner must only touch the depth-1 member.
+        let body = r#"{"messages":[{"role":"user","content":"{\"model\":\"evil\",\"a\":1}"}],"model":"model-a","stream":true,"temperature":0.7}"#;
+        let map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(body).unwrap();
+
+        let mut first_buf = Vec::new();
+        serde_json::to_writer(&mut first_buf, &map).unwrap();
+        let mut patched = Bytes::from(first_buf);
+
+        // 3 retries with rotation, mixed literal lengths.
+        let rotation = [
+            "\"z-ai/glm-5.3-alt\"",
+            "\"m-b\"",
+            "\"model-a-longer-name\"",
+        ];
+        for literal in rotation {
+            // Reference body: what the pre-patch code emitted (map rewrite +
+            // full re-serialize).
+            let mut reference_map = map.clone();
+            reference_map.insert(
+                "model".to_string(),
+                RawValue::from_string(literal.to_string()).unwrap(),
+            );
+            let mut ref_buf = Vec::new();
+            serde_json::to_writer(&mut ref_buf, &reference_map).unwrap();
+
+            match patch_serialized_model(&patched, literal) {
+                ModelPatch::Replaced(next) => patched = next,
+                _ => panic!("expected a model span patch for {literal}"),
+            }
+            assert_eq!(
+                patched.as_ref(),
+                ref_buf.as_slice(),
+                "patched body diverged from full re-serialize for {literal}"
+            );
+        }
+
+        let parsed: Value = serde_json::from_slice(&patched).unwrap();
+        assert_eq!(parsed["model"], "model-a-longer-name");
+        assert_eq!(parsed["messages"][0]["content"], r#"{"model":"evil","a":1}"#);
+    }
+
+    #[test]
+    fn model_patch_reports_unchanged_and_not_found() {
+        let body = r#"{"model":"m-a","stream":true}"#;
+        let bytes = Bytes::from_static(body.as_bytes());
+        assert!(matches!(
+            patch_serialized_model(&bytes, "\"m-a\""),
+            ModelPatch::Unchanged
+        ));
+        assert!(matches!(
+            patch_serialized_model(&bytes, "\"m-b\""),
+            ModelPatch::Replaced(_)
+        ));
+
+        // No top-level model (only a nested one): caller must re-serialize.
+        let nested = Bytes::from_static(br#"{"messages":[{"model":"x"}]}"#);
+        assert!(matches!(
+            patch_serialized_model(&nested, "\"m-b\""),
+            ModelPatch::NotFound
+        ));
+        // Malformed body: no panic, just NotFound.
+        let junk = Bytes::from_static(br#"{"model":"#);
+        assert!(matches!(
+            patch_serialized_model(&junk, "\"m-b\""),
+            ModelPatch::NotFound
+        ));
     }
 
     #[test]
