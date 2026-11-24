@@ -629,6 +629,21 @@ fn log_verbose() -> bool {
     })
 }
 
+/// Upstream statuses worth retrying. `retry-400` is a build-time opt-in for relays
+/// that answer 400 on transient conditions; the default build treats 400 as final.
+fn is_retryable_upstream_status(status: u16) -> bool {
+    let base = status == 429
+        || (500..=504).contains(&status)
+        || status == 522
+        || status == 524
+        || status == 529;
+    if cfg!(feature = "retry-400") {
+        base || status == 400
+    } else {
+        base
+    }
+}
+
 fn retry_delay(attempt: usize) -> Duration {
     let base = 1.0f64 * 2.0f64.powi(attempt as i32);
     let delay = base.min(16.0);
@@ -3284,11 +3299,7 @@ async fn dispatch_upstream(
                 // Retryable upstream statuses. Matches the Python shim's set:
                 // 429/500-504/524 plus 522 (CF could not reach the origin) and
                 // 529 (origin overloaded) -- both are transient, not client errors.
-                if (status_u16 == 429
-                    || (500..=504).contains(&status_u16)
-                    || status_u16 == 522
-                    || status_u16 == 524
-                    || status_u16 == 529)
+                if is_retryable_upstream_status(status_u16)
                     && attempt < preset.config.max_retry - 1
                 {
                     let err_preview = match tokio::time::timeout(
@@ -7061,6 +7072,23 @@ mod tests {
         let elem = &folded_arr[1..folded_arr.len() - 1];
         let spans = scan_message_spans(elem).expect("folded element must not contain duplicate keys");
         assert!(spans.content.is_some(), "content span missing after fold");
+    }
+
+    #[test]
+    fn test_retryable_status_set_respects_the_feature() {
+        assert!(is_retryable_upstream_status(429));
+        assert!(is_retryable_upstream_status(500));
+        assert!(is_retryable_upstream_status(504));
+        assert!(is_retryable_upstream_status(522));
+        assert!(is_retryable_upstream_status(529));
+        assert!(!is_retryable_upstream_status(401));
+        assert!(!is_retryable_upstream_status(404));
+        // 400 is final unless the retry-400 feature is compiled in.
+        assert_eq!(
+            is_retryable_upstream_status(400),
+            cfg!(feature = "retry-400"),
+            "400 must be retryable only in the retry-400 build"
+        );
     }
 
     #[test]
