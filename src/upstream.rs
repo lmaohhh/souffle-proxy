@@ -535,7 +535,8 @@ impl Target {
             .map_err(|e: http::uri::InvalidUri| UpstreamError::Other(e.to_string()))?;
         let native_uri = |suffix: &str| -> Result<http::Uri, UpstreamError> {
             format!("{}://{}:{}{}/{}", scheme, host, port, path_prefix, suffix)
-                .parse().map_err(|e: http::uri::InvalidUri| UpstreamError::Other(e.to_string()))
+                .parse()
+                .map_err(|e: http::uri::InvalidUri| UpstreamError::Other(e.to_string()))
         };
         let responses_uri = native_uri("responses")?;
         let compact_uri = native_uri("responses/compact")?;

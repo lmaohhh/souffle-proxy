@@ -41,8 +41,8 @@ use futures_util::StreamExt;
 use serde_json::{json, value::RawValue, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-mod upstream;
 mod responses;
+mod upstream;
 use upstream::{BodyStream, H2Client, H3Client, UpstreamClient, UpstreamError};
 
 // ---------------------------------------------------------------------------
@@ -3198,7 +3198,11 @@ async fn dispatch_upstream(
 
     // A native Responses request may execute hosted tools before a transport
     // failure. Never silently resubmit an ambiguously accepted generation.
-    let max_retry = if options.operation.native() { 1 } else { preset.config.max_retry };
+    let max_retry = if options.operation.native() {
+        1
+    } else {
+        preset.config.max_retry
+    };
 
     while attempt < max_retry {
         let t_dispatch = Instant::now();
@@ -3275,8 +3279,14 @@ async fn dispatch_upstream(
             Err(message) => return make_error_response(StatusCode::BAD_REQUEST, &message),
         };
         let user_agent = if options.operation.native() {
-            options.headers.get(header::USER_AGENT).cloned().unwrap_or_else(|| HeaderValue::from_static("souffle_proxy"))
-        } else { HeaderValue::from_static("curl/8.0.0") };
+            options
+                .headers
+                .get(header::USER_AGENT)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("souffle_proxy"))
+        } else {
+            HeaderValue::from_static("curl/8.0.0")
+        };
         let mut req_builder = http::Request::builder()
             .method(Method::POST)
             .uri(uri)
@@ -3308,9 +3318,14 @@ async fn dispatch_upstream(
             .header(header::EXPIRES, HeaderValue::from_static("0"));
 
         if options.operation.native() {
-            req_builder = req_builder.header(header::ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+            req_builder = req_builder.header(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
             for (name, value) in &options.headers {
-                if name != header::USER_AGENT { req_builder = req_builder.header(name, value); }
+                if name != header::USER_AGENT {
+                    req_builder = req_builder.header(name, value);
+                }
             }
         }
 
@@ -3342,25 +3357,49 @@ async fn dispatch_upstream(
             return match send_res {
                 Ok(Ok(response)) => {
                     let ttft = t_dispatch.elapsed().as_secs_f64();
-                    state.stats.total_ttft_us.fetch_add((ttft * 1_000_000.0) as u64, Ordering::Relaxed);
+                    state
+                        .stats
+                        .total_ttft_us
+                        .fetch_add((ttft * 1_000_000.0) as u64, Ordering::Relaxed);
                     state.stats.ttft_samples.fetch_add(1, Ordering::Relaxed);
-                    responses::forward(response.status, response.headers, response.body,
-                        state.clone(), preset.clone(), options.operation, is_stream,
-                        req_id, ttft, t_start, permit, active_guard).await
+                    responses::forward(
+                        response.status,
+                        response.headers,
+                        response.body,
+                        state.clone(),
+                        preset.clone(),
+                        options.operation,
+                        is_stream,
+                        req_id,
+                        ttft,
+                        t_start,
+                        permit,
+                        active_guard,
+                    )
+                    .await
                 }
                 Ok(Err(error)) => {
                     if let Some(conn_id) = error.conn_id {
                         if !is_terminal_upstream_error(&error.error) {
-                            if error.error.is_stream_scoped() { preset.client.invalidate_stream_if_same(conn_id).await; }
-                            else { preset.client.invalidate_if_same(conn_id).await; }
+                            if error.error.is_stream_scoped() {
+                                preset.client.invalidate_stream_if_same(conn_id).await;
+                            } else {
+                                preset.client.invalidate_if_same(conn_id).await;
+                            }
                         }
                     }
                     state.stats.error_count.fetch_add(1, Ordering::Relaxed);
-                    make_error_response(StatusCode::BAD_GATEWAY, &format!("Responses upstream transport failed: {}", error.error))
+                    make_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("Responses upstream transport failed: {}", error.error),
+                    )
                 }
                 Err(_) => {
                     state.stats.error_count.fetch_add(1, Ordering::Relaxed);
-                    make_error_response(StatusCode::GATEWAY_TIMEOUT, "Responses upstream request timed out")
+                    make_error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Responses upstream request timed out",
+                    )
                 }
             };
         }
@@ -3374,9 +3413,7 @@ async fn dispatch_upstream(
                 // Retryable upstream statuses. Matches the Python shim's set:
                 // 429/500-504/524 plus 522 (CF could not reach the origin) and
                 // 529 (origin overloaded) -- both are transient, not client errors.
-                if is_retryable_upstream_status(status_u16)
-                    && attempt < max_retry - 1
-                {
+                if is_retryable_upstream_status(status_u16) && attempt < max_retry - 1 {
                     let err_preview = match tokio::time::timeout(
                         ERROR_BODY_TIMEOUT,
                         upstream_resp.body.read_full_limited(ERROR_BODY_CAP),
@@ -4962,7 +4999,11 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     preset_obj["name"] = json!(preset.name);
-    preset_obj.as_object_mut().unwrap().entry("api_mode").or_insert_with(|| json!(preset.api_mode.as_str()));
+    preset_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("api_mode")
+        .or_insert_with(|| json!(preset.api_mode.as_str()));
     preset_obj["model"] = if preset.models.len() == 1 {
         json!(preset.models[0])
     } else {
@@ -5236,12 +5277,30 @@ async fn main() {
             "/chat/completions",
             post(handle_chat_completions).options(handle_options),
         )
-        .route("/v1/responses", post(handle_chat_completions).options(handle_options))
-        .route("/responses", post(handle_chat_completions).options(handle_options))
-        .route("/v1/responses/compact", post(handle_chat_completions).options(handle_options))
-        .route("/responses/compact", post(handle_chat_completions).options(handle_options))
-        .route("/v1/responses/input_tokens", post(handle_chat_completions).options(handle_options))
-        .route("/responses/input_tokens", post(handle_chat_completions).options(handle_options))
+        .route(
+            "/v1/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
         .fallback(handle_fallback)
         .with_state(state);
 
