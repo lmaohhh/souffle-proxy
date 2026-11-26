@@ -204,14 +204,15 @@ fn prepare_payload(
     };
     let mut include = Vec::new();
     if operation == Operation::Create {
-        for source in [map.get("include"), config.inject_raw.get("include")] {
-            if let Some(source) = source {
-                let values: Vec<String> = serde_json::from_str(source.get())
-                    .map_err(|_| "'include' must be an array of strings")?;
-                for value in values {
-                    if !include.contains(&value) {
-                        include.push(value);
-                    }
+        for source in [map.get("include"), config.inject_raw.get("include")]
+            .into_iter()
+            .flatten()
+        {
+            let values: Vec<String> = serde_json::from_str(source.get())
+                .map_err(|_| "'include' must be an array of strings")?;
+            for value in values {
+                if !include.contains(&value) {
+                    include.push(value);
                 }
             }
         }
@@ -235,7 +236,6 @@ fn prepare_payload(
         }
         reasoning.insert("summary".into(), json!("detailed"));
         include.push("reasoning.encrypted_content".into());
-        include.dedup();
         let mut seen = HashSet::new();
         include.retain(|value| seen.insert(value.clone()));
         map.insert("reasoning".into(), raw(Value::Object(reasoning)));
