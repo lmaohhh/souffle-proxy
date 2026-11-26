@@ -503,6 +503,9 @@ pub struct Target {
     pub host: String,
     pub port: u16,
     pub chat_uri: http::Uri,
+    pub responses_uri: http::Uri,
+    pub compact_uri: http::Uri,
+    pub input_tokens_uri: http::Uri,
 }
 
 impl Target {
@@ -530,12 +533,22 @@ impl Target {
         let chat_uri: http::Uri = chat_uri_str
             .parse()
             .map_err(|e: http::uri::InvalidUri| UpstreamError::Other(e.to_string()))?;
+        let native_uri = |suffix: &str| -> Result<http::Uri, UpstreamError> {
+            format!("{}://{}:{}{}/{}", scheme, host, port, path_prefix, suffix)
+                .parse().map_err(|e: http::uri::InvalidUri| UpstreamError::Other(e.to_string()))
+        };
+        let responses_uri = native_uri("responses")?;
+        let compact_uri = native_uri("responses/compact")?;
+        let input_tokens_uri = native_uri("responses/input_tokens")?;
         Ok(Self {
             base_url: upstream_url.to_string(),
             scheme,
             host,
             port,
             chat_uri,
+            responses_uri,
+            compact_uri,
+            input_tokens_uri,
         })
     }
 }

@@ -39,11 +39,12 @@
     },
     "gpt-6.1-sol": {
       "name": "gpt-6.1-sol",
+      "api_mode": "responses",
       "model": "gpt-6.1-sol",
       "key_env": "SOUFFLE_API_KEY",
       "upstream_bases": ["https://api.soufflotheque.internal/v1"],
       "inject": {
-        "reasoning_effort": "max"
+        "reasoning": { "effort": "max", "summary": "detailed" }
       }
     },
     "glm-5.3-flash": {
