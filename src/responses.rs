@@ -146,6 +146,7 @@ fn object_field(
 ) -> Result<serde_json::Map<String, Value>, String> {
     match map.get(key) {
         None => Ok(serde_json::Map::new()),
+        Some(v) if v.get().trim() == "null" => Ok(serde_json::Map::new()),
         Some(v) => serde_json::from_str::<serde_json::Map<String, Value>>(v.get())
             .map_err(|_| format!("'{key}' must be a JSON object")),
     }
@@ -208,6 +209,9 @@ fn prepare_payload(
             .into_iter()
             .flatten()
         {
+            if source.get().trim() == "null" {
+                continue;
+            }
             let values: Vec<String> = serde_json::from_str(source.get())
                 .map_err(|_| "'include' must be an array of strings")?;
             for value in values {
@@ -216,7 +220,11 @@ fn prepare_payload(
                 }
             }
         }
-        if let Some(injected) = config.inject.get("reasoning") {
+        if let Some(injected) = config
+            .inject
+            .get("reasoning")
+            .filter(|value| !value.is_null())
+        {
             let fields = injected
                 .as_object()
                 .ok_or("Injected 'reasoning' must be a JSON object")?;
@@ -1154,7 +1162,7 @@ mod tests {
         let chat = crate::tests::make_test_app_state("http://127.0.0.1:1/v1", false, 1);
         assert_eq!(
             handle_chat_completions(
-                State(chat),
+                State(chat.clone()),
                 request("/v1/responses", r#"{"input":"hello"}"#)
             )
             .await
@@ -1164,13 +1172,17 @@ mod tests {
         let native = native_state("http://127.0.0.1:1/v1");
         assert_eq!(
             handle_chat_completions(
-                State(native),
+                State(native.clone()),
                 request("/v1/chat/completions", r#"{"messages":[]}"#)
             )
             .await
             .status(),
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(chat.stats.error_count.load(Ordering::Relaxed), 1);
+        assert_eq!(native.stats.error_count.load(Ordering::Relaxed), 1);
+        assert_eq!(chat.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(native.stats.active_requests.load(Ordering::Relaxed), 0);
         let stored = Request::builder()
             .uri("/v1/responses/resp_old")
             .body(Body::empty())
@@ -1287,5 +1299,35 @@ mod tests {
         assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
         assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 0);
         assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn native_nullable_reasoning_and_include_get_defaults_without_losing_input() {
+        let state = native_state("http://127.0.0.1:1/v1");
+        let source = r#"{"input":[ {"type":"reasoning","encrypted_content":"OPAQUE\\\u0041","summary":[]} ],"reasoning":null,"include":null}"#;
+        let map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(source).unwrap();
+        let input = map["input"].get().to_owned();
+        let (prepared, _) =
+            prepare_payload(map, &state.slots[0].config, Operation::Create).unwrap();
+        assert_eq!(prepared.map["input"].get(), input);
+        assert_eq!(
+            serde_json::from_str::<Value>(prepared.map["reasoning"].get()).unwrap(),
+            json!({"summary":"detailed"})
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(prepared.map["include"].get()).unwrap(),
+            json!(["reasoning.encrypted_content"])
+        );
+        for invalid in [
+            r#"{"input":"hello","reasoning":7}"#,
+            r#"{"input":"hello","include":[7]}"#,
+        ] {
+            assert!(prepare_payload(
+                serde_json::from_str(invalid).unwrap(),
+                &state.slots[0].config,
+                Operation::Create
+            )
+            .is_err());
+        }
     }
 }
