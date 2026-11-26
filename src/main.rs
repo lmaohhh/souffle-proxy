@@ -1735,6 +1735,7 @@ async fn chat_completions_raw_path(
     }
     let preset = state.slots[slot_idx].clone();
     if preset.config.api_mode != responses::ApiMode::ChatCompletions {
+        state.stats.error_count.fetch_add(1, Ordering::Relaxed);
         return make_error_response(StatusCode::BAD_REQUEST, "Selected preset uses Responses; send a native /v1/responses request instead of Chat Completions");
     }
 
@@ -4961,7 +4962,7 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     preset_obj["name"] = json!(preset.name);
-    preset_obj["api_mode"] = json!(preset.api_mode.as_str());
+    preset_obj.as_object_mut().unwrap().entry("api_mode").or_insert_with(|| json!(preset.api_mode.as_str()));
     preset_obj["model"] = if preset.models.len() == 1 {
         json!(preset.models[0])
     } else {
