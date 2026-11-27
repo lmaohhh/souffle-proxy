@@ -1566,10 +1566,10 @@ fn publish_sse_usage(u: &UsageStats, metrics: &StreamMetrics) {
     }
 }
 
-/// Build the " tokens=N (reasoning=M, X t/s)" log suffix; empty when no
+/// Build the labeled " tokens=N (reasoning=M, X t/s)" log suffix; empty when no
 /// completion tokens were reported. Shared by the Drop guard and the
 /// usage-stats accumulator.
-fn format_token_info(tokens: u64, reasoning: u64, elapsed: f64, ttft: f64) -> String {
+fn format_token_info(tokens: u64, reasoning: u64, elapsed: f64, ttft: f64, label: &str) -> String {
     if tokens == 0 {
         return String::new();
     }
@@ -1577,18 +1577,24 @@ fn format_token_info(tokens: u64, reasoning: u64, elapsed: f64, ttft: f64) -> St
     let tps = tokens as f64 / gen_time;
     if reasoning > 0 {
         format!(
-            " tokens={} (reasoning={}, {:.1} t/s)",
+            " {label}={} (reasoning={}, {:.1} t/s)",
             tokens, reasoning, tps
         )
     } else {
-        format!(" tokens={} ({:.1} t/s)", tokens, tps)
+        format!(" {label}={} ({:.1} t/s)", tokens, tps)
     }
 }
 
 /// Accumulate one usage object into ProxyStats (prompt/reasoning/completion)
 /// and build the " tokens=..." log suffix. Shared by the streaming
 /// end-of-body and buffered-response paths.
-fn apply_usage_stats(stats: &ProxyStats, usage: &UsageStats, elapsed: f64, ttft: f64) -> String {
+fn apply_usage_stats(
+    stats: &ProxyStats,
+    usage: &UsageStats,
+    elapsed: f64,
+    ttft: f64,
+    label: &str,
+) -> String {
     let mut token_info = String::new();
     if let Some(p) = usage.prompt_tokens {
         stats.total_tokens_prompt.fetch_add(p, Ordering::Relaxed);
@@ -1603,7 +1609,7 @@ fn apply_usage_stats(stats: &ProxyStats, usage: &UsageStats, elapsed: f64, ttft:
         stats
             .total_tokens_completion
             .fetch_add(c, Ordering::Relaxed);
-        token_info = format_token_info(c, reasoning, elapsed, ttft);
+        token_info = format_token_info(c, reasoning, elapsed, ttft, label);
     }
     token_info
 }
@@ -4440,8 +4446,9 @@ impl Drop for StreamDisconnectGuard {
                     .total_tokens_reasoning
                     .fetch_add(reasoning, Ordering::Relaxed);
             }
-            let token_info =
-                format_token_info(tokens, reasoning, elapsed, self.token_timing.seconds());
+            let token_info = format_token_info(
+                tokens, reasoning, elapsed, self.token_timing.seconds(), "tokens",
+            );
             log(
                 &format!(
                     "DONE [OK] chunks={} bytes={:.1}KB elapsed={:.2}s{}",
@@ -4939,6 +4946,7 @@ fn stream_response(
                     usage,
                     elapsed,
                     token_timing.seconds(),
+                    "tokens",
                 );
             }
 
@@ -5006,7 +5014,7 @@ async fn buffer_response(
     let mut token_info = String::new();
     // Extract token usage
     if let Some(ref u) = usage {
-        token_info = apply_usage_stats(&state.stats, u, elapsed, 0.0);
+        token_info = apply_usage_stats(&state.stats, u, elapsed, 0.0, "tokens");
     }
 
     state.stats.success_count.fetch_add(1, Ordering::Relaxed);

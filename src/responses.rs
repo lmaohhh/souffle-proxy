@@ -554,14 +554,21 @@ impl Drop for NativeStreamGuard {
         } else {
             0.0
         };
-        apply_usage_stats(stats, &usage, self.start.elapsed().as_secs_f64(), ttft);
+        let elapsed = self.start.elapsed().as_secs_f64();
+        let token_info = apply_usage_stats(stats, &usage, elapsed, ttft, "completion");
         stats
             .total_tokens_cached
             .fetch_add(self.cached.load(Ordering::Relaxed), Ordering::Relaxed);
+        let outcome = match terminal {
+            1 => "OK",
+            2 => "FAILED",
+            _ => "CANCELLED",
+        };
         log(
             &format!(
-                "Responses stream end terminal={terminal} bytes={}",
-                self.metrics.bytes.load(Ordering::Relaxed)
+                "Responses DONE [{outcome}] chunks={} bytes={:.1}KB elapsed={elapsed:.2}s{token_info}",
+                self.metrics.chunks.load(Ordering::Relaxed),
+                self.metrics.bytes.load(Ordering::Relaxed) as f64 / 1024.0
             ),
             Some(&self.req_id),
         );
@@ -700,9 +707,10 @@ pub(crate) async fn forward(
         } else {
             state.stats.success_count.fetch_add(1, Ordering::Relaxed);
         }
-        if let Some(usage) = &observation.usage {
-            apply_usage_stats(&state.stats, usage, start.elapsed().as_secs_f64(), 0.0);
-        }
+        let elapsed = start.elapsed().as_secs_f64();
+        let token_info = observation.usage.as_ref().map_or_else(String::new, |usage| {
+            apply_usage_stats(&state.stats, usage, elapsed, 0.0, "completion")
+        });
         state
             .stats
             .total_tokens_cached
@@ -711,6 +719,14 @@ pub(crate) async fn forward(
             .stats
             .total_bytes
             .fetch_add(body.len() as u64, Ordering::Relaxed);
+        let outcome = if observation.terminal == Terminal::Failed { "FAILED" } else { "OK" };
+        log(
+            &format!(
+                "Responses non-stream complete [{outcome}] {:.1}KB headers={header_latency:.2}s elapsed={elapsed:.2}s{token_info}",
+                body.len() as f64 / 1024.0
+            ),
+            Some(&req_id),
+        );
         let mut response = Response::new(Body::from(body));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
