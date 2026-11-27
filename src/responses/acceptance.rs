@@ -27,37 +27,40 @@ async fn native_mounted_routes_forward_all_aliases_and_queries() {
             })
             .await;
             let state = native_state(&format!("http://{addr}/custom/v1"));
-            let response = build_router(state.clone())
-                .oneshot(request(
-                    &format!("{prefix}{suffix}?fixture=mounted"),
-                    r#"{"input":"synthetic fixture"}"#,
-                ))
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
-            assert_eq!(
-                axum::body::to_bytes(response.into_body(), 4096)
+            for (index, body) in [
+                r#"{"input":"synthetic fixture"}"#,
+                r#"{"input":"synthetic fixture","model":"wrong-caller-model"}"#,
+            ].into_iter().enumerate() {
+                let response = build_router(state.clone())
+                    .oneshot(request(&format!("{prefix}{suffix}?fixture=mounted"), body))
                     .await
-                    .unwrap(),
-                wire
-            );
-            let records = captured.lock().unwrap();
-            assert_eq!(records.len(), 1);
-            assert_eq!(
-                records[0].path,
-                format!("/custom/v1/responses{suffix}?fixture=mounted")
-            );
-            let payload: Value = serde_json::from_slice(&records[0].body).unwrap();
-            assert_eq!(payload["model"], "test-model");
-            assert_eq!(payload["input"], "synthetic fixture");
-            if suffix.is_empty() {
-                assert_eq!(payload["store"], false);
-            } else {
-                assert!(payload.get("store").is_none());
-                assert!(payload.get("reasoning").is_none());
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                assert_eq!(response.headers()[header::CONTENT_TYPE], "application/json");
+                assert_eq!(
+                    axum::body::to_bytes(response.into_body(), 4096)
+                        .await
+                        .unwrap(),
+                    wire
+                );
+                let records = captured.lock().unwrap();
+                assert_eq!(records.len(), index + 1);
+                let record = records.last().unwrap();
+                assert_eq!(
+                    record.path,
+                    format!("/custom/v1/responses{suffix}?fixture=mounted")
+                );
+                let payload: Value = serde_json::from_slice(&record.body).unwrap();
+                assert_eq!(payload["model"], "Souffle-6.1");
+                assert_eq!(payload["input"], "synthetic fixture");
+                if suffix.is_empty() {
+                    assert_eq!(payload["store"], false);
+                } else {
+                    assert!(payload.get("store").is_none());
+                    assert!(payload.get("reasoning").is_none());
+                }
+                assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
             }
-            assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
         }
     }
 }
@@ -146,7 +149,7 @@ async fn native_mounted_methods_stored_operations_and_unknown_routes() {
 }
 
 #[tokio::test]
-async fn native_mounted_mixed_slots_use_virtual_model_ids() {
+async fn native_mounted_mixed_slots_route_responses_by_endpoint() {
     let (chat_addr, chat_calls) = server(Reply {
         status: 200,
         headers: vec![("content-type", "application/json")],
@@ -181,18 +184,19 @@ async fn native_mounted_mixed_slots_use_virtual_model_ids() {
         ),
         (
             "/v1/chat/completions",
-            r#"{"model":"deepseek-sol","messages":[]}"#,
+            r#"{"model":"deepseek-sol","messages":[{"role":"user","content":"fixture"}]}"#,
             StatusCode::BAD_REQUEST,
         ),
         (
             "/v1/responses",
             r#"{"model":"actual-gpt-model","input":"fixture"}"#,
-            StatusCode::BAD_REQUEST,
+            StatusCode::OK,
         ),
+        ("/v1/responses", r#"{"input":"fixture"}"#, StatusCode::OK),
         (
             "/v1/responses",
-            r#"{"input":"fixture"}"#,
-            StatusCode::BAD_REQUEST,
+            r#"{"model":"deepseek-souffle","input":"fixture"}"#,
+            StatusCode::OK,
         ),
     ] {
         let response = router.clone().oneshot(request(path, body)).await.unwrap();
@@ -202,11 +206,86 @@ async fn native_mounted_mixed_slots_use_virtual_model_ids() {
             .unwrap();
     }
     assert_eq!(chat_calls.lock().unwrap().len(), 1);
-    assert_eq!(native_calls.lock().unwrap().len(), 1);
-    assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 2);
-    assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 3);
+    let native_calls = native_calls.lock().unwrap();
+    assert_eq!(native_calls.len(), 4);
+    for call in native_calls.iter() {
+        let payload: Value = serde_json::from_slice(&call.body).unwrap();
+        assert_eq!(payload["model"], "Souffle-6.1");
+    }
+    assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 5);
+    assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
     assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
     assert_eq!(state.semaphore.available_permits(), 20);
+}
+
+#[tokio::test]
+async fn native_endpoint_selects_responses_slot_when_it_is_first() {
+    let (chat_addr, chat_calls) = server(Reply {
+        status: 200,
+        headers: vec![("content-type", "application/json")],
+        chunks: vec![Bytes::from_static(
+            br#"{"choices":[{"message":{"content":"chat fixture"},"finish_reason":"stop"}]}"#,
+        )],
+    })
+    .await;
+    let (native_addr, native_calls) = server(Reply {
+        status: 200,
+        headers: vec![("content-type", "application/json")],
+        chunks: vec![Bytes::from_static(br#"{"status":"completed","output":[]}"#)],
+    })
+    .await;
+    let mut state = native_state(&format!("http://{native_addr}/v1"));
+    let mut chat_state =
+        crate::tests::make_test_app_state(&format!("http://{chat_addr}/v1"), false, 1);
+    let chat_slot = Arc::get_mut(&mut chat_state).unwrap().slots[0].clone();
+    Arc::get_mut(&mut state).unwrap().slots.push(chat_slot);
+    let router = build_router(state.clone());
+    let response = router
+        .clone()
+        .oneshot(request(
+            "/v1/responses",
+            r#"{"model":"deepseek-sol","input":"fixture"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    let response = router
+        .oneshot(request(
+            "/v1/chat/completions",
+            r#"{"model":"deepseek-sol","messages":[{"role":"user","content":"fixture"}]}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    axum::body::to_bytes(response.into_body(), 4096)
+        .await
+        .unwrap();
+    assert_eq!(native_calls.lock().unwrap().len(), 1);
+    let native_calls = native_calls.lock().unwrap();
+    let payload: Value = serde_json::from_slice(&native_calls[0].body).unwrap();
+    assert_eq!(payload["model"], "Souffle-6.1");
+    assert_eq!(chat_calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn native_mounted_multiple_responses_presets_are_ambiguous() {
+    let mut state = native_state("http://127.0.0.1:1/v1");
+    let second = native_state("http://127.0.0.1:2/v1");
+    Arc::get_mut(&mut state).unwrap().slots.push(second.slots[0].clone());
+    let response = build_router(state.clone())
+        .oneshot(request("/v1/responses", r#"{"model":"deepseek-sol","input":"fixture"}"#))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+    let error: Value = serde_json::from_slice(&body).unwrap();
+    assert!(error["error"]["message"].as_str().unwrap().contains("ambiguous"));
+    assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
+    assert_eq!(state.semaphore.available_permits(), 20);
+    assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
 }
 
 struct H3Fixture {

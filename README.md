@@ -75,10 +75,12 @@ In dual-slot mode, `model: "deepseek-souffle"` selects the first preset and
 `model: "deepseek-sol"` selects the second. These are local routing IDs; the
 selected preset supplies the upstream model. For example,
 `souffle_proxy --preset glm-5.3 --preset gpt-6.1-sol` serves chat on slot 1 and
-Responses on slot 2. Native callers must send `model: "deepseek-sol"` in this
-arrangement. An unknown ID, including the upstream GPT model name, selects
-slot 1 and receives a protocol mismatch error. Startup output identifies each
-slot's `api_mode`.
+Responses on slot 2. Requests to a native Responses endpoint select the sole
+Responses preset regardless of the caller's `model`; the proxy overwrites that
+field with the preset's upstream model (`Souffle-6.1` in the example config).
+Chat Completions retains local slot-ID routing. If multiple Responses presets
+are configured, native endpoints reject the request as ambiguous. Startup
+output identifies each slot's `api_mode`.
 
 The native HTTP endpoints are `POST /v1/responses`, `/v1/responses/compact`, and
 `/v1/responses/input_tokens` (unversioned aliases also work). Creation supports
@@ -104,6 +106,14 @@ client owns retry decisions. Legitimate incoming client identity headers are
 preserved, while upstream authorization comes from the selected preset. SSE
 events are forwarded unchanged; typed terminal events and native usage populate
 `/stats`, and EOF before a terminal event breaks the downstream transfer.
+
+`avg_ttft_seconds` measures request receipt to the first observed nonempty
+generated SSE delta, including reasoning and tool-argument deltas. Headers,
+setup events and empty deltas do not qualify. Only successful streaming
+generations contribute samples; buffered responses, auxiliary operations,
+failed streams and streams without a generated delta have no measurable TTFT.
+Header latency is logged separately. Read timeouts bound individual waits;
+they are not a total time-to-first-token deadline.
 
 ## Quickstart
 
@@ -162,8 +172,8 @@ Tunable via environment variables:
 - `SOUFFLE_PROXY_PORT` (default: `8799`)
 - `SOUFFLE_MAX_CONCURRENCY` (default: `20`)
 - `SOUFFLE_CONNECT_TIMEOUT` (default: `30.0`s)
-- `SOUFFLE_WRITE_TIMEOUT` (deprecated, ignored; outbound send/TTFT timeout uses `SOUFFLE_READ_TIMEOUT`)
-- `SOUFFLE_READ_TIMEOUT` (default: `600.0`s; idle stream read cap & TTFT deadline)
+- `SOUFFLE_WRITE_TIMEOUT` (deprecated, ignored; upstream response/read timeouts use `SOUFFLE_READ_TIMEOUT`)
+- `SOUFFLE_READ_TIMEOUT` (default: `600.0`s; initial response/first-chunk deadline and response-body read cap)
 - `SOUFFLE_MAX_RETRY` (default: `15`)
 - `SOUFFLE_MAX_BODY_BYTES` (default: `67108864` / 64MB)
 - `SOUFFLE_KEEPALIVE_EXPIRY` (default: 60s; h2 PING keepalive on the pooled upstream connection; 0 = disabled)
