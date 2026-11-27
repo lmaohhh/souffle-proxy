@@ -36,7 +36,7 @@ guarantee instead of a hope.
 
 - **Accurate stream accounting.** Every chunk and byte transferred across the wire is faithfully credited to `/stats` (`total_chunks`, `total_bytes`), even when a stream terminates prematurely due to upstream reset, idle timeout, or client disconnection.
 - **Native stateless Responses.** GPT Responses presets use `api_mode: "responses"` and forward native HTTP/SSE items without converting them to Chat Completions. See the protocol contract below.
-- **Strict routing with clear errors.** Unmatched endpoints or invalid methods return standard OpenAI-format `404 Not Found` JSON errors instead of swallowing typos with 200 OK health checks.
+- **Strict routing with clear errors.** Unmatched endpoints return OpenAI-format `404 Not Found` JSON errors. Unsupported methods on a known endpoint return `405 Method Not Allowed` with an `Allow` header.
 - **Knows when the client walked away.** A thread-safe (`Send + Sync`) atomic Drop guard inside the stream generator logs the
   disconnect, credits stats, frees the concurrency slot, and moves on.
 - **Caps everything that can grow.** Request bodies (64 MB default), upstream error bodies
@@ -66,6 +66,22 @@ a clear error, never a conversion. A Responses preset must have exactly one
 concrete `model`, one `key_env`, and one `upstream_bases` entry: rotating opaque
 reasoning across models or accounts would break continuation.
 
+For example, the `gpt-6.1-sol` preset in `config.json.example` selects Responses
+and sets native `reasoning` parameters. Launch it with
+`souffle_proxy --headless --preset gpt-6.1-sol`; point the client at the local
+`/v1` base and use its Responses API.
+
+In dual-slot mode, `model: "deepseek-souffle"` selects the first preset and
+`model: "deepseek-sol"` selects the second. These are local routing IDs; the
+selected preset supplies the upstream model. For example,
+`souffle_proxy --preset glm-5.3 --preset gpt-6.1-sol` serves chat on slot 1 and
+Responses on slot 2. Requests to a native Responses endpoint select the sole
+Responses preset regardless of the caller's `model`; the proxy overwrites that
+field with the preset's upstream model (`Souffle-6.1` in the example config).
+Chat Completions retains local slot-ID routing. If multiple Responses presets
+are configured, native endpoints reject the request as ambiguous. Startup
+output identifies each slot's `api_mode`.
+
 The native HTTP endpoints are `POST /v1/responses`, `/v1/responses/compact`, and
 `/v1/responses/input_tokens` (unversioned aliases also work). Creation supports
 JSON and SSE. This change does not implement WebSocket transport. Auxiliary
@@ -90,6 +106,14 @@ client owns retry decisions. Legitimate incoming client identity headers are
 preserved, while upstream authorization comes from the selected preset. SSE
 events are forwarded unchanged; typed terminal events and native usage populate
 `/stats`, and EOF before a terminal event breaks the downstream transfer.
+
+`avg_ttft_seconds` measures request receipt to the first observed nonempty
+generated SSE delta, including reasoning and tool-argument deltas. Headers,
+setup events and empty deltas do not qualify. Only successful streaming
+generations contribute samples; buffered responses, auxiliary operations,
+failed streams and streams without a generated delta have no measurable TTFT.
+Header latency is logged separately. Read timeouts bound individual waits;
+they are not a total time-to-first-token deadline.
 
 ## Quickstart
 
@@ -148,8 +172,8 @@ Tunable via environment variables:
 - `SOUFFLE_PROXY_PORT` (default: `8799`)
 - `SOUFFLE_MAX_CONCURRENCY` (default: `20`)
 - `SOUFFLE_CONNECT_TIMEOUT` (default: `30.0`s)
-- `SOUFFLE_WRITE_TIMEOUT` (deprecated, ignored; outbound send/TTFT timeout uses `SOUFFLE_READ_TIMEOUT`)
-- `SOUFFLE_READ_TIMEOUT` (default: `600.0`s; idle stream read cap & TTFT deadline)
+- `SOUFFLE_WRITE_TIMEOUT` (deprecated, ignored; upstream response/read timeouts use `SOUFFLE_READ_TIMEOUT`)
+- `SOUFFLE_READ_TIMEOUT` (default: `600.0`s; initial response/first-chunk deadline and response-body read cap)
 - `SOUFFLE_MAX_RETRY` (default: `15`)
 - `SOUFFLE_MAX_BODY_BYTES` (default: `67108864` / 64MB)
 - `SOUFFLE_KEEPALIVE_EXPIRY` (default: 60s; h2 PING keepalive on the pooled upstream connection; 0 = disabled)
@@ -163,6 +187,10 @@ Tunable via environment variables:
 - `SOUFFLE_LOG_LEVEL` (default: quiet — verbose log lines suppressed; `verbose` restores them).
 
 Per-preset in `config.json`:
+- `api_mode`: `"chat_completions"` (default) or `"responses"`. The latter requires
+  one model, one key and one upstream base. Native Responses bypass chat message
+  splicing, CoT folding and repetition detection; auxiliary endpoints also skip
+  generation-only preset injection.
 - `model`: upstream model ID or array of model IDs for round-robin rotation. Also answers to
   `models` and the alias fields (`alias`, `aliases`, `model_alias`, `model_aliases`) — all merged.
 - `key_env`: env var name or array of env var names for round-robin key rotation

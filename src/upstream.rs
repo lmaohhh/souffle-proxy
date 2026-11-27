@@ -1553,7 +1553,7 @@ pub fn configure_tcp_keepalive(stream: &tokio::net::TcpStream) -> std::io::Resul
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
@@ -1708,9 +1708,7 @@ mod tests {
         221, 13, 6, 206, 226, 23,
     ];
 
-    async fn spawn_mock_h3_server(
-        bind_addr: std::net::SocketAddr,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    pub(crate) fn h3_server_config() -> quinn::ServerConfig {
         let cert = rustls::pki_types::CertificateDer::from(TEST_CERT_DER);
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(TEST_KEY_DER.into());
         let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
@@ -1722,10 +1720,15 @@ mod tests {
         .with_single_cert(vec![cert], key)
         .unwrap();
         tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-        let quic_srv_cfg = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg).unwrap(),
-        ));
-        let endpoint = quinn::Endpoint::server(quic_srv_cfg, bind_addr).unwrap();
+        ))
+    }
+
+    async fn spawn_mock_h3_server(
+        bind_addr: std::net::SocketAddr,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let endpoint = quinn::Endpoint::server(h3_server_config(), bind_addr).unwrap();
         let local_addr = endpoint.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {
@@ -1861,21 +1864,7 @@ mod tests {
         bind_addr: std::net::SocketAddr,
         gate: Arc<tokio::sync::Semaphore>,
     ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
-        let cert = rustls::pki_types::CertificateDer::from(TEST_CERT_DER);
-        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(TEST_KEY_DER.into());
-        let mut tls_cfg = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(&[&rustls::version::TLS13])
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert], key)
-        .unwrap();
-        tls_cfg.alpn_protocols = vec![b"h3".to_vec()];
-        let quic_srv_cfg = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(tls_cfg).unwrap(),
-        ));
-        let endpoint = quinn::Endpoint::server(quic_srv_cfg, bind_addr).unwrap();
+        let endpoint = quinn::Endpoint::server(h3_server_config(), bind_addr).unwrap();
         let local_addr = endpoint.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {

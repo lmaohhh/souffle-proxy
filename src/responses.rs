@@ -171,12 +171,17 @@ fn reject_stored_context(map: &BTreeMap<String, Box<RawValue>>) -> Result<(), St
             for item in items {
                 if let Ok(fields) = serde_json::from_str::<BTreeMap<String, &RawValue>>(item.get())
                 {
-                    if fields
+                    let explicit_reference = fields
                         .get("type")
                         .and_then(|v| serde_json::from_str::<String>(v.get()).ok())
                         .as_deref()
-                        == Some("item_reference")
-                    {
+                        == Some("item_reference");
+                    // ItemReference.type is optional. A complete implicit
+                    // message may also have an id, so retain role/content items.
+                    let implicit_reference = fields.contains_key("id")
+                        && fields.get("type").is_none_or(|v| v.get().trim() == "null")
+                        && !(fields.contains_key("role") && fields.contains_key("content"));
+                    if explicit_reference || implicit_reference {
                         return Err("Stateless Responses cannot resolve item_reference; send the complete item".into());
                     }
                 }
@@ -285,7 +290,28 @@ pub(crate) async fn raw_path(
         .get("model")
         .and_then(|v| serde_json::from_str::<String>(v.get()).ok())
         .unwrap_or_default();
-    let preset = state.slots[select_slot_index(&model, state.slots.len())].clone();
+    let slot_index = if options.operation.native() {
+        let mut response_slots = state
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(_, slot)| slot.config.api_mode == ApiMode::Responses)
+            .map(|(index, _)| index);
+        match (response_slots.next(), response_slots.next()) {
+            (Some(index), None) => index,
+            (Some(_), Some(_)) => {
+                return local_error(
+                    &state,
+                    StatusCode::BAD_REQUEST,
+                    "Native Responses endpoint is ambiguous: configure only one Responses preset",
+                );
+            }
+            (None, _) => select_slot_index(&model, state.slots.len()),
+        }
+    } else {
+        select_slot_index(&model, state.slots.len())
+    };
+    let preset = state.slots[slot_index].clone();
     if preset.config.api_mode != ApiMode::Responses {
         return local_error(&state, StatusCode::BAD_REQUEST, "Selected preset uses chat_completions; configure api_mode: responses for native Responses requests");
     }
@@ -353,9 +379,9 @@ struct NativeUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     #[serde(default)]
-    input_tokens_details: TokenDetails,
+    input_tokens_details: Option<TokenDetails>,
     #[serde(default)]
-    output_tokens_details: TokenDetails,
+    output_tokens_details: Option<TokenDetails>,
 }
 
 // Only observe metadata. In particular, deserialization skips the potentially
@@ -364,9 +390,14 @@ struct NativeUsage {
 struct Metadata {
     #[serde(rename = "type")]
     kind: Option<String>,
+    delta: Option<Value>,
     status: Option<String>,
     usage: Option<NativeUsage>,
     response: Option<Box<Metadata>>,
+}
+
+fn has_generated_delta(value: &Value) -> bool {
+    matches!(value, Value::String(text) if !text.is_empty())
 }
 
 #[derive(Default)]
@@ -381,12 +412,18 @@ struct Observation {
 }
 
 impl Observation {
-    fn value(&mut self, value: &Metadata, event: bool) {
+    fn value(&mut self, value: &Metadata, event: bool) -> bool {
         let body = if event {
             value.response.as_deref().unwrap_or(value)
         } else {
             value
         };
+        let generated_delta = event
+            && value
+                .kind
+                .as_deref()
+                .is_some_and(|kind| kind.starts_with("response.") && kind.ends_with(".delta"))
+            && value.delta.as_ref().is_some_and(has_generated_delta);
         let terminal = if event {
             value.kind.as_deref()
         } else {
@@ -409,38 +446,55 @@ impl Observation {
             self.usage = Some(UsageStats {
                 prompt_tokens: usage.input_tokens,
                 completion_tokens: usage.output_tokens,
-                reasoning_tokens: usage.output_tokens_details.reasoning_tokens,
+                reasoning_tokens: usage
+                    .output_tokens_details
+                    .as_ref()
+                    .and_then(|v| v.reasoning_tokens),
                 completion_tokens_details: None,
             });
-            self.cached = usage.input_tokens_details.cached_tokens.unwrap_or(0);
+            self.cached = usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|v| v.cached_tokens)
+                .unwrap_or(0);
         }
+        generated_delta
     }
 
-    fn feed(&mut self, chunk: &[u8], limit: usize) {
+    fn feed(&mut self, mut chunk: &[u8], limit: usize) -> bool {
         if self.malformed {
-            return;
+            return false;
         }
-        if self.buffer.len().saturating_add(chunk.len()) > limit {
-            self.malformed = true;
-            self.buffer.clear();
-            self.data.clear();
-            return;
-        }
-        self.buffer.extend_from_slice(chunk);
-        while let Some(end) = memchr::memchr2(b'\n', b'\r', &self.buffer) {
-            let terminator = self.buffer[end];
-            let line = self.buffer.split_to(end + 1);
-            if self.skip_lf && end == 0 && terminator == b'\n' {
+        let mut generated_delta = false;
+        while !chunk.is_empty() {
+            // Bound unfinished lines and event data, not transport chunks:
+            // one H2/H3 read can contain arbitrarily many complete events.
+            let end = memchr::memchr2(b'\n', b'\r', chunk);
+            let len = end.map_or(chunk.len(), |end| end + 1);
+            if self.buffer.len().saturating_add(len) > limit {
+                self.malformed = true;
+                self.buffer.clear();
+                self.data.clear();
+                return generated_delta;
+            }
+            self.buffer.extend_from_slice(&chunk[..len]);
+            chunk = &chunk[len..];
+            if end.is_none() {
+                return generated_delta;
+            }
+            let line = self.buffer.split_to(self.buffer.len());
+            let terminator = line[line.len() - 1];
+            let line = &line[..line.len() - 1];
+            if self.skip_lf && line.is_empty() && terminator == b'\n' {
                 self.skip_lf = false;
                 continue;
             }
             self.skip_lf = terminator == b'\r';
-            let line = &line[..end];
             if line.is_empty() {
                 if !self.data.is_empty() {
                     let data = std::mem::take(&mut self.data);
                     if let Ok(value) = serde_json::from_slice::<Metadata>(&data) {
-                        self.value(&value, true);
+                        generated_delta |= self.value(&value, true);
                     }
                 }
             } else if let Some(data) = line.strip_prefix(b"data:") {
@@ -448,7 +502,7 @@ impl Observation {
                 if self.data.len().saturating_add(data.len()).saturating_add(1) > limit {
                     self.malformed = true;
                     self.data.clear();
-                    return;
+                    return generated_delta;
                 }
                 if !self.data.is_empty() {
                     self.data.push(b'\n');
@@ -456,6 +510,7 @@ impl Observation {
                 self.data.extend_from_slice(data);
             }
         }
+        generated_delta
     }
 }
 
@@ -464,7 +519,7 @@ struct NativeStreamGuard {
     metrics: Arc<StreamMetrics>,
     terminal: Arc<AtomicU8>,
     req_id: String,
-    ttft: f64,
+    token_timing: Arc<FirstTokenTiming>,
     start: Instant,
     cached: Arc<AtomicU64>,
 }
@@ -474,6 +529,7 @@ impl Drop for NativeStreamGuard {
         let stats = &self.state.stats;
         let terminal = self.terminal.load(Ordering::Relaxed);
         if terminal == 1 {
+            self.token_timing.commit(&self.state.stats);
             stats.success_count.fetch_add(1, Ordering::Relaxed);
         }
         if terminal == 2 {
@@ -493,7 +549,12 @@ impl Drop for NativeStreamGuard {
             reasoning_tokens: Some(self.metrics.reasoning_tokens.load(Ordering::Relaxed)),
             completion_tokens_details: None,
         };
-        apply_usage_stats(stats, &usage, self.start.elapsed().as_secs_f64(), self.ttft);
+        let ttft = if terminal == 1 {
+            self.token_timing.seconds()
+        } else {
+            0.0
+        };
+        apply_usage_stats(stats, &usage, self.start.elapsed().as_secs_f64(), ttft);
         stats
             .total_tokens_cached
             .fetch_add(self.cached.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -548,7 +609,8 @@ pub(crate) async fn forward(
     operation: Operation,
     stream: bool,
     req_id: String,
-    ttft: f64,
+    header_latency: f64,
+    token_timing: Arc<FirstTokenTiming>,
     start: Instant,
     permit: OwnedSemaphorePermit,
     active_guard: ActiveRequestGuard,
@@ -576,6 +638,10 @@ pub(crate) async fn forward(
         *response.headers_mut() = response_headers(&headers, &state);
         return response;
     }
+    log(
+        &format!("Upstream response headers in {header_latency:.2}s."),
+        Some(&req_id),
+    );
     // Transport does not decompress. Negotiate identity explicitly and reject an
     // upstream that violates it, rather than mislabeling compressed bytes as SSE.
     if headers
@@ -635,7 +701,7 @@ pub(crate) async fn forward(
             state.stats.success_count.fetch_add(1, Ordering::Relaxed);
         }
         if let Some(usage) = &observation.usage {
-            apply_usage_stats(&state.stats, usage, start.elapsed().as_secs_f64(), ttft);
+            apply_usage_stats(&state.stats, usage, start.elapsed().as_secs_f64(), 0.0);
         }
         state
             .stats
@@ -659,12 +725,13 @@ pub(crate) async fn forward(
         terminal: terminal.clone(),
         cached: cached.clone(),
         req_id: req_id.clone(),
-        ttft,
+        token_timing: token_timing.clone(),
         start,
     };
     let body = stream! {
         let _permit = permit; let _active_guard = active_guard; let _guard = guard;
         let mut observation = Observation::default();
+        let measure_ttft = operation == Operation::Create;
         loop {
             let chunk = match tokio::time::timeout(preset.config.read_timeout, upstream.next()).await {
                 Ok(Some(Ok(chunk))) => chunk,
@@ -684,13 +751,22 @@ pub(crate) async fn forward(
                 }
                 Err(_) => { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Responses stream idle timeout")); break; }
             };
+            let received_at = Instant::now();
+            let generated_delta = observation.feed(&chunk, preset.config.max_body_bytes);
+            if measure_ttft && generated_delta {
+                if let Some(ttft) = token_timing.record_at(received_at) {
+                    log(
+                        &format!("TTFT={ttft:.3}s to first generated delta"),
+                        Some(&req_id),
+                    );
+                }
+            }
+            if observation.malformed { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Responses SSE event exceeded max_body_bytes")); break; }
             metrics.chunks.fetch_add(1, Ordering::Relaxed); metrics.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-            observation.feed(&chunk, preset.config.max_body_bytes);
             if let Some(usage) = &observation.usage { publish_sse_usage(usage, &metrics); }
             cached.store(observation.cached, Ordering::Relaxed);
             terminal.store(observation.terminal as u8, Ordering::Relaxed);
             yield Ok::<Bytes, std::io::Error>(chunk);
-            if observation.malformed { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Responses SSE event exceeded max_body_bytes")); break; }
             if observation.terminal != Terminal::Pending { break; }
         }
     };
@@ -701,24 +777,27 @@ pub(crate) async fn forward(
 }
 
 #[cfg(test)]
+mod acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
     #[derive(Clone)]
-    struct Reply {
-        status: u16,
-        headers: Vec<(&'static str, &'static str)>,
-        chunks: Vec<Bytes>,
+    pub(super) struct Reply {
+        pub(super) status: u16,
+        pub(super) headers: Vec<(&'static str, &'static str)>,
+        pub(super) chunks: Vec<Bytes>,
     }
 
-    struct Captured {
-        path: String,
-        headers: HeaderMap,
-        body: Vec<u8>,
+    pub(super) struct Captured {
+        pub(super) path: String,
+        pub(super) headers: HeaderMap,
+        pub(super) body: Vec<u8>,
     }
 
-    async fn server(reply: Reply) -> (std::net::SocketAddr, Arc<Mutex<Vec<Captured>>>) {
+    pub(super) async fn server(reply: Reply) -> (std::net::SocketAddr, Arc<Mutex<Vec<Captured>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -767,17 +846,19 @@ mod tests {
         (addr, captured)
     }
 
-    fn native_state(base: &str) -> Arc<AppState> {
+    pub(super) fn native_state(base: &str) -> Arc<AppState> {
         let mut state = crate::tests::make_test_app_state(base, true, 15);
         let slot = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().slots[0]).unwrap();
         let config = Arc::get_mut(&mut slot.config).unwrap();
         config.api_mode = ApiMode::Responses;
+        config.models = vec!["Souffle-6.1".into()];
+        config.models_raw = models_to_raw(&config.models).unwrap();
         config.souffle_pout = true;
         config.prepend_raw = Some(r#"{"role":"system","content":"must not be injected"}"#.into());
         state
     }
 
-    fn request(path: &str, body: &str) -> Request {
+    pub(super) fn request(path: &str, body: &str) -> Request {
         Request::builder()
             .method(Method::POST)
             .uri(path)
@@ -791,7 +872,7 @@ mod tests {
             .unwrap()
     }
 
-    fn completed() -> &'static str {
+    pub(super) fn completed() -> &'static str {
         "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":6},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n"
     }
 
@@ -900,6 +981,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn responses_example_uses_exact_souffle_model() {
+        let example: Value = serde_json::from_str(include_str!("../config.json.example")).unwrap();
+        let preset = Preset::from_value("gpt-6.1-sol", &example["presets"]["gpt-6.1-sol"])
+            .unwrap();
+        assert_eq!(preset.api_mode, ApiMode::Responses);
+        assert_eq!(preset.models, ["Souffle-6.1"]);
+    }
+
     #[tokio::test]
     async fn native_endpoint_prefixes_and_queries_are_shared_by_h2_and_h3() {
         let base = "https://example.test/custom/v1/";
@@ -926,6 +1016,167 @@ mod tests {
                 assert_eq!(uri.host(), Some("example.test"));
             }
         }
+    }
+
+    #[test]
+    fn native_sse_event_limit_is_independent_of_transport_chunks() {
+        for ending in ["\n", "\r\n", "\r"] {
+            let first = format!("data: {{\"type\":\"future.event\",{ending}data: \"text\":\"opaque\"}}{ending}{ending}");
+            let last = format!("data: {{\"type\":\"response.completed\"}}{ending}{ending}");
+            let source = format!("{first}{last}");
+            let limit = first.len().max(last.len());
+            for size in 1..=source.len() {
+                let mut observation = Observation::default();
+                for chunk in source.as_bytes().chunks(size) {
+                    observation.feed(chunk, limit);
+                }
+                assert!(!observation.malformed, "ending {ending:?}, chunk size {size}");
+                assert_eq!(observation.terminal, Terminal::Completed);
+            }
+            for size in 1..=source.len() {
+                let mut observation = Observation::default();
+                for chunk in source.as_bytes().chunks(size) {
+                    observation.feed(chunk, 16);
+                }
+                assert!(observation.malformed);
+            }
+        }
+    }
+
+    #[test]
+    fn native_sse_ttft_observes_only_nonempty_delta_after_fragment_completion() {
+        let stats = ProxyStats::new();
+        let start = Instant::now();
+        let timing = FirstTokenTiming::new(start);
+        let mut observation = Observation::default();
+        assert!(!observation.feed(b"data: {\"type\":\"response.created\"}\n\n", 4096));
+        assert!(!observation.feed(
+            b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n",
+            4096
+        ));
+        let event = b"data: {\"type\":\"response.output_text.delta\",\"delta\":\"token\"}\n\n";
+        let split = event.len() / 2;
+        assert!(!observation.feed(&event[..split], 4096));
+        let received_at = start + Duration::from_millis(90);
+        assert!(observation.feed(&event[split..], 4096));
+        assert_eq!(timing.record_at(received_at), Some(0.09));
+        assert!(!observation.feed(
+            b"data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n",
+            4096
+        ));
+        assert_eq!(observation.terminal, Terminal::Completed);
+        assert_eq!(stats.ttft_samples.load(Ordering::Relaxed), 0);
+        timing.commit(&stats);
+        assert_eq!(stats.ttft_samples.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total_ttft_us.load(Ordering::Relaxed), 90_000);
+    }
+
+    #[tokio::test]
+    async fn native_oversized_sse_chunk_is_rejected_before_forwarding() {
+        let wire = format!(
+            "data: {{\"type\":\"future.event\",\"text\":\"{}\"}}\n\n",
+            "x".repeat(256)
+        );
+        let (addr, _) = server(Reply {
+            status: 200,
+            headers: vec![("content-type", "text/event-stream")],
+            chunks: vec![Bytes::from(wire)],
+        })
+        .await;
+        let mut state = native_state(&format!("http://{addr}/v1"));
+        Arc::get_mut(
+            &mut Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().slots[0])
+                .unwrap()
+                .config,
+        )
+        .unwrap()
+        .max_body_bytes = 64;
+        let response = handle_chat_completions(
+            State(state.clone()),
+            request("/v1/responses", r#"{"input":"hello","stream":true}"#),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        assert!(matches!(body.next().await, Some(Err(_))));
+        drop(body);
+        assert_eq!(state.stats.total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
+        assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.semaphore.available_permits(), 20);
+    }
+
+    #[tokio::test]
+    async fn native_nullable_usage_details_preserve_terminal_and_wire_bytes() {
+        let body = r#"{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":null,"output_tokens_details":null}}"#;
+        for stream in [false, true] {
+            let wire = if stream {
+                format!("data: {{\"type\":\"response.completed\",\"response\":{body}}}\n\n")
+            } else {
+                body.to_owned()
+            };
+            let (addr, _) = server(Reply {
+                status: 200,
+                headers: vec![(
+                    "content-type",
+                    if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )],
+                chunks: vec![Bytes::from(wire.clone())],
+            })
+            .await;
+            let state = native_state(&format!("http://{addr}/v1"));
+            let response = handle_chat_completions(
+                State(state.clone()),
+                request(
+                    "/v1/responses",
+                    &format!(r#"{{"input":"hello","stream":{stream}}}"#),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+                wire
+            );
+            assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 1);
+            assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 0);
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
+            assert_eq!(state.stats.total_tokens_prompt.load(Ordering::Relaxed), 10);
+            assert_eq!(
+                state.stats.total_tokens_completion.load(Ordering::Relaxed),
+                4
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_implicit_item_references_are_rejected_before_dispatch() {
+        let (addr, captured) = server(Reply {
+            status: 200,
+            headers: vec![("content-type", "application/json")],
+            chunks: vec![Bytes::from_static(br#"{"status":"completed"}"#)],
+        })
+        .await;
+        let state = native_state(&format!("http://{addr}/v1"));
+        for body in [
+            r#"{"input":[{"id":"msg_old"}]}"#,
+            r#"{"input":[{"id":"rs_old","type":null}]}"#,
+        ] {
+            let response =
+                handle_chat_completions(State(state.clone()), request("/v1/responses", body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        let source = r#"{"input":[ {"id":"msg_full","role":"assistant","content":"hello"}, {"id":"rs_full","type":"reasoning","encrypted_content":"OPAQUE","summary":[]} ]}"#;
+        let map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(source).unwrap();
+        let original = map["input"].get().to_owned();
+        let (payload, _) = prepare_payload(map, &state.slots[0].config, Operation::Create).unwrap();
+        assert_eq!(payload.map["input"].get(), original);
     }
 
     #[test]
@@ -987,6 +1238,7 @@ mod tests {
             assert_eq!(captured.lock().unwrap().len(), 1);
             assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 0);
             assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1056,12 +1308,58 @@ mod tests {
             3
         );
         assert_eq!(state.stats.total_tokens_cached.load(Ordering::Relaxed), 6);
+        assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn native_ttft_counts_fragmented_generation_delta_once() {
+        let wire = concat!(
+            "data: {\"type\":\"response.created\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"\"}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\"}}\n\n"
+        );
+        use crate::tests::{spawn_mock_h2_server, MockUpstreamReply};
+        let split = wire.find("hello").unwrap() + 2;
+        let (addr, _, _, _) =
+            spawn_mock_h2_server(vec![MockUpstreamReply::StreamDelayedSchedule {
+                steps: vec![
+                    (
+                        Bytes::copy_from_slice(&wire.as_bytes()[..split]),
+                        Duration::ZERO,
+                    ),
+                    (
+                        Bytes::copy_from_slice(&wire.as_bytes()[split..]),
+                        Duration::from_millis(100),
+                    ),
+                ],
+            }])
+            .await;
+        let state = native_state(&format!("http://{addr}/v1"));
+        let response = handle_chat_completions(
+            State(state.clone()),
+            request(
+                "/v1/responses",
+                r#"{"input":"hello","stream":true,"model":"not-the-provider-model"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap(),
+            wire
+        );
+        assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 1);
+        assert!(state.stats.total_ttft_us.load(Ordering::Relaxed) >= 90_000);
+        assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
     async fn native_failed_incomplete_and_error_terminals_are_forwarded_but_not_successes() {
         for kind in ["response.failed", "response.incomplete", "error"] {
-            let wire=format!("event: {kind}\ndata: {{\"type\":\"{kind}\",\"response\":{{\"status\":\"failed\"}}}}\n\n");
+            let wire=format!("data: {{\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}}\n\nevent: {kind}\ndata: {{\"type\":\"{kind}\",\"response\":{{\"status\":\"failed\"}}}}\n\n");
             let (addr, _) = server(Reply {
                 status: 200,
                 headers: vec![("content-type", "text/event-stream")],
@@ -1082,6 +1380,7 @@ mod tests {
             );
             assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 0);
             assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1109,6 +1408,7 @@ mod tests {
             assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 0);
             assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
             assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
         }
     }
 
@@ -1147,6 +1447,7 @@ mod tests {
                     .unwrap(),
                 body
             );
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
             let records = captured.lock().unwrap();
             assert_eq!(records[0].path, format!("/v1{path}"));
             let payload: Value = serde_json::from_slice(&records[0].body).unwrap();

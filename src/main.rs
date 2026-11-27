@@ -19,7 +19,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, IsTerminal, Write};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -510,7 +510,7 @@ impl Config {
         let connect_timeout = env_timeout("SOUFFLE_CONNECT_TIMEOUT", 30.0);
         if env::var("SOUFFLE_WRITE_TIMEOUT").is_ok() {
             log(
-                "WARNING: SOUFFLE_WRITE_TIMEOUT is deprecated and ignored; outbound send/TTFT timeout uses SOUFFLE_READ_TIMEOUT.",
+                "WARNING: SOUFFLE_WRITE_TIMEOUT is deprecated and ignored; upstream response/read timeouts use SOUFFLE_READ_TIMEOUT.",
                 None,
             );
         }
@@ -797,6 +797,7 @@ impl ProxyStats {
             "success_count": self.success_count.load(Ordering::Relaxed),
             "error_count": self.error_count.load(Ordering::Relaxed),
             "avg_ttft_seconds": avg_ttft,
+            "ttft_samples": samples,
             "total_chunks": self.total_chunks.load(Ordering::Relaxed),
             "total_bytes": self.total_bytes.load(Ordering::Relaxed),
             "total_tokens": {
@@ -807,6 +808,167 @@ impl ProxyStats {
             }
         })
     }
+}
+
+struct FirstTokenTiming {
+    request_started: Instant,
+    first_token_us: AtomicU64,
+    committed: AtomicBool,
+}
+
+impl FirstTokenTiming {
+    const UNRECORDED: u64 = u64::MAX;
+
+    fn new(request_started: Instant) -> Self {
+        Self {
+            request_started,
+            first_token_us: AtomicU64::new(Self::UNRECORDED),
+            committed: AtomicBool::new(false),
+        }
+    }
+
+    fn record_at(&self, observed_at: Instant) -> Option<f64> {
+        let elapsed_us = observed_at
+            .saturating_duration_since(self.request_started)
+            .as_micros()
+            .min((u64::MAX - 1) as u128) as u64;
+        self.first_token_us
+            .compare_exchange(
+                Self::UNRECORDED,
+                elapsed_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .ok()?;
+        Some(elapsed_us as f64 / 1_000_000.0)
+    }
+
+    fn commit(&self, stats: &ProxyStats) {
+        let elapsed_us = self.first_token_us.load(Ordering::Relaxed);
+        if elapsed_us == Self::UNRECORDED
+            || self
+                .committed
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        stats.total_ttft_us.fetch_add(elapsed_us, Ordering::Relaxed);
+        stats.ttft_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn recorded(&self) -> bool {
+        self.first_token_us.load(Ordering::Relaxed) != Self::UNRECORDED
+    }
+
+    fn seconds(&self) -> f64 {
+        let elapsed_us = self.first_token_us.load(Ordering::Relaxed);
+        if elapsed_us == Self::UNRECORDED {
+            0.0
+        } else {
+            elapsed_us as f64 / 1_000_000.0
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct ChatTokenProbe {
+    choices: Option<Vec<ChatTokenChoice>>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatTokenChoice {
+    delta: Option<ChatTokenDelta>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatTokenDelta {
+    content: Option<Value>,
+    reasoning_content: Option<Value>,
+    reasoning: Option<Value>,
+    refusal: Option<Value>,
+    audio: Option<Value>,
+    tool_calls: Option<Vec<ChatTokenCall>>,
+    function_call: Option<ChatTokenFunctionCall>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatTokenCall {
+    function: Option<ChatTokenFunctionCall>,
+}
+
+#[derive(serde::Deserialize)]
+struct ChatTokenFunctionCall {
+    name: Option<Value>,
+    arguments: Option<Value>,
+}
+
+fn has_nonempty_text(value: &Value) -> bool {
+    match value {
+        Value::String(text) => !text.is_empty(),
+        Value::Array(items) => items.iter().any(has_nonempty_text),
+        Value::Object(fields) => fields.get("text").is_some_and(has_nonempty_text),
+        _ => false,
+    }
+}
+
+fn chat_sse_line_has_generated_delta(line: &[u8]) -> bool {
+    let Some(data) = line
+        .trim_ascii()
+        .strip_prefix(b"data:")
+        .map(|data| data.trim_ascii())
+    else {
+        return false;
+    };
+    if !data.windows(7).any(|window| window == b"\"delta\"") {
+        return false;
+    }
+    let Ok(event) = serde_json::from_slice::<ChatTokenProbe>(data) else {
+        return false;
+    };
+    event.choices.into_iter().flatten().any(|choice| {
+        let Some(delta) = choice.delta else {
+            return false;
+        };
+        [
+            delta.content.as_ref(),
+            delta.reasoning_content.as_ref(),
+            delta.reasoning.as_ref(),
+            delta.refusal.as_ref(),
+            delta.audio.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .any(has_nonempty_text)
+            || delta.tool_calls.into_iter().flatten().any(|call| {
+                call.function.is_some_and(|function| {
+                    function.name.as_ref().is_some_and(has_nonempty_text)
+                        || function.arguments.as_ref().is_some_and(has_nonempty_text)
+                })
+            })
+            || delta.function_call.is_some_and(|function| {
+                function.name.as_ref().is_some_and(has_nonempty_text)
+                    || function.arguments.as_ref().is_some_and(has_nonempty_text)
+            })
+    })
+}
+
+fn chat_sse_line_has_error(line: &[u8]) -> bool {
+    let line = line.trim_ascii();
+    if line.strip_prefix(b"event:").is_some_and(|kind| kind.trim_ascii() == b"error") {
+        return true;
+    }
+    let Some(data) = line.strip_prefix(b"data:") else {
+        return false;
+    };
+    if !data.windows(7).any(|part| part == b"\"error\"") {
+        return false;
+    }
+    #[derive(serde::Deserialize)]
+    struct ErrorProbe {
+        error: Option<serde::de::IgnoredAny>,
+    }
+    serde_json::from_slice::<ErrorProbe>(data).is_ok_and(|event| event.error.is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -1185,6 +1347,7 @@ struct StreamMetrics {
     chunks: AtomicU64,
     bytes: AtomicU64,
     seen_done: std::sync::atomic::AtomicBool,
+    seen_error: AtomicBool,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
     reasoning_tokens: AtomicU64,
@@ -1527,6 +1690,49 @@ async fn handle_fallback(req: Request) -> Response {
             }),
         )
     }
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(handle_health))
+        .route("/", get(handle_health))
+        .route("/v1/models", get(handle_models))
+        .route("/models", get(handle_models))
+        .route("/stats", get(handle_stats))
+        .route(
+            "/v1/chat/completions",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/chat/completions",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .fallback(handle_fallback)
+        .with_state(state)
 }
 
 static HEALTH_JSON_BYTES: &[u8] =
@@ -3257,7 +3463,7 @@ async fn dispatch_upstream(
             // Normal verbosity: attempt 1 is silent; retries stay visible.
             log(
                 &format!(
-                    "Dispatching attempt {}/{} ({}). Waiting for TTFT...",
+                    "Dispatching attempt {}/{} ({}). Waiting for response headers...",
                     attempt + 1,
                     preset.config.max_retry,
                     preset.client.transport_name()
@@ -3356,12 +3562,8 @@ async fn dispatch_upstream(
         if options.operation.native() {
             return match send_res {
                 Ok(Ok(response)) => {
-                    let ttft = t_dispatch.elapsed().as_secs_f64();
-                    state
-                        .stats
-                        .total_ttft_us
-                        .fetch_add((ttft * 1_000_000.0) as u64, Ordering::Relaxed);
-                    state.stats.ttft_samples.fetch_add(1, Ordering::Relaxed);
+                    let header_latency = t_dispatch.elapsed().as_secs_f64();
+                    let token_timing = Arc::new(FirstTokenTiming::new(t_start));
                     responses::forward(
                         response.status,
                         response.headers,
@@ -3371,7 +3573,8 @@ async fn dispatch_upstream(
                         options.operation,
                         is_stream,
                         req_id,
-                        ttft,
+                        header_latency,
+                        token_timing,
                         t_start,
                         permit,
                         active_guard,
@@ -3408,7 +3611,7 @@ async fn dispatch_upstream(
                 let conn_id = upstream_resp.conn_id;
                 let status = upstream_resp.status;
                 let status_u16 = status.as_u16();
-                let ttft = t_dispatch.elapsed().as_secs_f64();
+                let header_latency = t_dispatch.elapsed().as_secs_f64();
 
                 // Retryable upstream statuses. Matches the Python shim's set:
                 // 429/500-504/524 plus 522 (CF could not reach the origin) and
@@ -3489,12 +3692,7 @@ async fn dispatch_upstream(
                     return make_json_response(client_status, err_json);
                 }
 
-                // Record TTFT (lock-free)
-                state
-                    .stats
-                    .total_ttft_us
-                    .fetch_add((ttft * 1_000_000.0) as u64, Ordering::Relaxed);
-                state.stats.ttft_samples.fetch_add(1, Ordering::Relaxed);
+                let token_timing = Arc::new(FirstTokenTiming::new(t_start));
 
                 let upstream_status = upstream_resp.status;
                 let upstream_headers = upstream_resp.headers;
@@ -3710,6 +3908,7 @@ async fn dispatch_upstream(
                             }
                         }
                     };
+                    let first_chunk_received_at = Instant::now();
 
                     let mut is_empty = false;
                     if first_chunk.is_empty() {
@@ -3809,7 +4008,9 @@ async fn dispatch_upstream(
                         state.clone(),
                         preset.clone(),
                         req_id,
-                        ttft,
+                        header_latency,
+                        token_timing.clone(),
+                        first_chunk_received_at,
                         t_start,
                         permit,
                         active_guard,
@@ -3950,7 +4151,7 @@ async fn dispatch_upstream(
                         body_bytes,
                         state.clone(),
                         req_id,
-                        ttft,
+                        header_latency,
                         t_start,
                         permit,
                         active_guard,
@@ -4121,12 +4322,12 @@ async fn dispatch_upstream(
             Err(_) => {
                 log(
                     &format!(
-                        "Upstream response timeout ({:.1}s) waiting for headers (TTFT)",
+                        "Upstream response timeout ({:.1}s) waiting for headers",
                         send_timeout.as_secs_f64()
                     ),
                     Some(&req_id),
                 );
-                // A TTFT timeout means the pooled connection may be wedged while still
+                // A response-header timeout means the pooled connection may be wedged while still
                 // reporting ready; drop it so the retry dials fresh (mirrors the
                 // Ok(Err) branch, which invalidates on transport failure).
                 preset.client.invalidate_connection().await;
@@ -4143,7 +4344,7 @@ async fn dispatch_upstream(
                 state.stats.error_count.fetch_add(1, Ordering::Relaxed);
                 return make_text_response(
                     StatusCode::GATEWAY_TIMEOUT,
-                    "Upstream response timeout (TTFT)",
+                    "Upstream response-header timeout",
                 );
             }
         }
@@ -4164,7 +4365,7 @@ struct StreamDisconnectGuard {
     done: std::sync::atomic::AtomicBool,
     // Shared counters written by the stream! body, readable here on Drop.
     metrics: Arc<StreamMetrics>,
-    ttft: f64,
+    token_timing: Arc<FirstTokenTiming>,
     t_start: Instant,
     state: Arc<AppState>,
 }
@@ -4173,7 +4374,7 @@ impl StreamDisconnectGuard {
     fn new(
         req_id: String,
         metrics: Arc<StreamMetrics>,
-        ttft: f64,
+        token_timing: Arc<FirstTokenTiming>,
         t_start: Instant,
         state: Arc<AppState>,
     ) -> Self {
@@ -4181,7 +4382,7 @@ impl StreamDisconnectGuard {
             req_id,
             done: std::sync::atomic::AtomicBool::new(false),
             metrics,
-            ttft,
+            token_timing,
             t_start,
             state,
         }
@@ -4203,6 +4404,9 @@ impl Drop for StreamDisconnectGuard {
 
         if self.metrics.seen_done.load(Ordering::Relaxed) {
             // Client closed after [DONE] was seen — this is a successful completion.
+            if !self.metrics.seen_error.load(Ordering::Relaxed) {
+                self.token_timing.commit(&self.state.stats);
+            }
             self.state
                 .stats
                 .success_count
@@ -4236,7 +4440,8 @@ impl Drop for StreamDisconnectGuard {
                     .total_tokens_reasoning
                     .fetch_add(reasoning, Ordering::Relaxed);
             }
-            let token_info = format_token_info(tokens, reasoning, elapsed, self.ttft);
+            let token_info =
+                format_token_info(tokens, reasoning, elapsed, self.token_timing.seconds());
             log(
                 &format!(
                     "DONE [OK] chunks={} bytes={:.1}KB elapsed={:.2}s{}",
@@ -4339,7 +4544,9 @@ fn stream_response(
     state: Arc<AppState>,
     preset: Arc<PresetRuntime>,
     req_id: String,
-    ttft: f64,
+    header_latency: f64,
+    token_timing: Arc<FirstTokenTiming>,
+    first_chunk_received_at: Instant,
     t_start: Instant,
     permit: OwnedSemaphorePermit,
     active_guard: ActiveRequestGuard,
@@ -4350,8 +4557,8 @@ fn stream_response(
 
     log(
         &format!(
-            "TTFT={:.2}s upstream={} ({:?}). Streaming...",
-            ttft,
+            "Upstream response headers in {:.2}s; streaming status={} ({:?}).",
+            header_latency,
             upstream_status.as_u16(),
             upstream_version
         ),
@@ -4386,7 +4593,7 @@ fn stream_response(
         let disconnect_guard = StreamDisconnectGuard::new(
             req_id_clone.clone(),
             shared_metrics.clone(),
-            ttft,
+            token_timing.clone(),
             t_start,
             state.clone(),
         );
@@ -4411,7 +4618,8 @@ fn stream_response(
                              sse_buffer: &mut BytesMut,
                              repeat_watch: &mut Option<RepeatWatch>,
                              repeat_skip_until: usize,
-                             warned_huge_sse_line: &mut bool|
+                             warned_huge_sse_line: &mut bool,
+                             received_at: Instant|
          -> Option<RepeatMatch> {
             sse_buffer.extend_from_slice(chunk);
             if sse_buffer.len() > 1024 * 1024 && !*warned_huge_sse_line {
@@ -4427,6 +4635,9 @@ fn stream_response(
                 let pos = start + rel;
                 let line = &sse_buffer[start..pos];
                 if !line.is_empty() {
+                    if chat_sse_line_has_error(line) {
+                        shared_metrics.seen_error.store(true, Ordering::Relaxed);
+                    }
                     if !*seen_done && is_sse_done_line(line) {
                         *seen_done = true;
                         shared_metrics.seen_done.store(true, Ordering::Relaxed);
@@ -4436,6 +4647,16 @@ fn stream_response(
                                 publish_sse_usage(&u, &shared_metrics);
                                 *last_usage = Some(u);
                             }
+                        }
+                    }
+                    if upstream_status.is_success()
+                        && !token_timing.recorded()
+                        && chat_sse_line_has_generated_delta(line) {
+                        if let Some(ttft) = token_timing.record_at(received_at) {
+                            log(
+                                &format!("TTFT={ttft:.3}s to first generated delta"),
+                                Some(&req_id_clone),
+                            );
                         }
                     }
                     if repeat_hit.is_none() && pos >= repeat_skip_until {
@@ -4473,6 +4694,7 @@ fn stream_response(
                 &mut repeat_watch,
                 first_chunk_repeat_fed_until,
                 &mut warned_huge_sse_line,
+                first_chunk_received_at,
             );
             yield Ok::<Bytes, std::io::Error>(first_chunk);
         }
@@ -4515,6 +4737,7 @@ fn stream_response(
                         &mut repeat_watch,
                         0,
                         &mut warned_huge_sse_line,
+                        now.into_std(),
                     ) {
                         log(
                             &format!(
@@ -4561,6 +4784,7 @@ fn stream_response(
                                         &mut repeat_watch,
                                         0,
                                         &mut warned_huge_sse_line,
+                                        Instant::now(),
                                     ) {
                                         hit_during_drain = Some(hit);
                                         break;
@@ -4703,11 +4927,19 @@ fn stream_response(
                 Some(&req_id_clone),
             );
         } else {
+            if seen_done && !shared_metrics.seen_error.load(Ordering::Relaxed) {
+                token_timing.commit(&state_clone.stats);
+            }
             state_clone.stats.success_count.fetch_add(1, Ordering::Relaxed);
 
             let mut token_info = String::new();
             if let Some(usage) = &last_usage {
-                token_info = apply_usage_stats(&state_clone.stats, usage, elapsed, ttft);
+                token_info = apply_usage_stats(
+                    &state_clone.stats,
+                    usage,
+                    elapsed,
+                    token_timing.seconds(),
+                );
             }
 
             log(
@@ -4756,7 +4988,7 @@ async fn buffer_response(
     body_bytes: Bytes,
     state: Arc<AppState>,
     req_id: String,
-    ttft: f64,
+    header_latency: f64,
     t_start: Instant,
     _permit: OwnedSemaphorePermit,
     _active_guard: ActiveRequestGuard,
@@ -4774,7 +5006,7 @@ async fn buffer_response(
     let mut token_info = String::new();
     // Extract token usage
     if let Some(ref u) = usage {
-        token_info = apply_usage_stats(&state.stats, u, elapsed, ttft);
+        token_info = apply_usage_stats(&state.stats, u, elapsed, 0.0);
     }
 
     state.stats.success_count.fetch_add(1, Ordering::Relaxed);
@@ -4785,10 +5017,10 @@ async fn buffer_response(
 
     log(
         &format!(
-            "Non-stream complete ({:?}) {:.1}KB TTFT={:.2}s elapsed={:.2}s{}",
+            "Non-stream complete ({:?}) {:.1}KB headers={:.2}s elapsed={:.2}s{}",
             upstream_version,
             body_bytes.len() as f64 / 1024.0,
-            ttft,
+            header_latency,
             elapsed,
             token_info
         ),
@@ -5263,46 +5495,7 @@ async fn main() {
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/", get(handle_health))
-        .route("/v1/models", get(handle_models))
-        .route("/models", get(handle_models))
-        .route("/stats", get(handle_stats))
-        .route(
-            "/v1/chat/completions",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/chat/completions",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses/compact",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses/compact",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses/input_tokens",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses/input_tokens",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .fallback(handle_fallback)
-        .with_state(state);
+    let app = build_router(state);
 
     let cfg0 = &slot_configs[0];
     log(
@@ -5342,10 +5535,11 @@ async fn main() {
     if slot_configs.len() > 1 {
         for (slot_idx, cfg) in slot_configs.iter().enumerate() {
             log(&format!(
-                "Slot {} ({}) → Preset: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
+                "Slot {} ({}) → Preset: {} | api_mode: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
                 slot_idx + 1,
                 if slot_idx == 0 { "deepseek-souffle" } else { "deepseek-sol" },
                 cfg.preset_name,
+                cfg.api_mode.as_str(),
                 if cfg.models.len() > 1 {
                     format!("{:?} (round-robin)", cfg.models)
                 } else {
@@ -5396,8 +5590,9 @@ async fn main() {
             None,
         );
     } else {
-        log(&format!("Preset: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
+        log(&format!("Preset: {} | api_mode: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
             cfg0.preset_name,
+            cfg0.api_mode.as_str(),
             if cfg0.models.len() > 1 {
                 format!("{:?} (round-robin)", cfg0.models)
             } else {
@@ -5601,6 +5796,131 @@ mod tests {
             "data: {{\"choices\":[{{\"delta\":{{\"content\":{}}}}}]}}\n\n",
             json!(payload)
         )
+    }
+
+    #[test]
+    fn first_token_timing_observes_once_and_commits_only_when_successful() {
+        let stats = ProxyStats::new();
+        let start = Instant::now();
+        let timing = FirstTokenTiming::new(start);
+        assert_eq!(
+            timing.record_at(start + Duration::from_millis(37)),
+            Some(0.037)
+        );
+        assert_eq!(timing.record_at(start + Duration::from_millis(90)), None);
+        assert_eq!(stats.ttft_samples.load(Ordering::Relaxed), 0);
+        timing.commit(&stats);
+        timing.commit(&stats);
+        assert_eq!(stats.ttft_samples.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.total_ttft_us.load(Ordering::Relaxed), 37_000);
+
+        FirstTokenTiming::new(start).commit(&stats);
+        assert_eq!(stats.ttft_samples.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn chat_sse_ttft_probe_ignores_setup_empty_and_terminal_frames() {
+        for line in [
+            b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}".as_slice(),
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"\",\"reasoning_content\":\"\"}}]}"
+                .as_slice(),
+            b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}".as_slice(),
+            b"data: {\"usage\":{\"completion_tokens\":0}}".as_slice(),
+            b"data: [DONE]".as_slice(),
+        ] {
+            assert!(!chat_sse_line_has_generated_delta(line), "{line:?}");
+        }
+        for line in [
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}".as_slice(),
+            b"data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking\"}}]}".as_slice(),
+            b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"lookup\"}}]}}]}".as_slice(),
+            b"data: {\"choices\":[{\"delta\":{\"function_call\":{\"arguments\":\"{}\"}}}]}".as_slice(),
+        ] {
+            assert!(chat_sse_line_has_generated_delta(line), "{line:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_ttft_uses_final_fragment_of_first_nonempty_delta() {
+        let setup =
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n");
+        let empty_delta =
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"\"}}]}\n\n");
+        let first_delta_fragment =
+            Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"first");
+        let final_delta_fragment = Bytes::from_static(b" token\"}}]}\n\n");
+        let done = Bytes::from_static(b"data: [DONE]\n\n");
+        let (addr, _, _, _) =
+            spawn_mock_h2_server(vec![MockUpstreamReply::StreamDelayedSchedule {
+                steps: vec![
+                    (setup, Duration::from_millis(10)),
+                    (empty_delta, Duration::from_millis(30)),
+                    (first_delta_fragment, Duration::from_millis(20)),
+                    (final_delta_fragment, Duration::from_millis(40)),
+                    (done, Duration::ZERO),
+                ],
+            }])
+            .await;
+        let state = make_test_app_state(&format!("http://{addr}/v1"), false, 1);
+        let response = handle_chat_completions(State(state.clone()), make_chat_req(true)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body).unwrap().contains("first token"));
+        let stats = state.stats.snapshot().await;
+        let ttft = stats["avg_ttft_seconds"].as_f64().unwrap();
+        assert!((0.08..1.0).contains(&ttft), "unexpected TTFT: {ttft}s");
+        assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn chat_ttft_preserves_first_chunk_observation_before_downstream_poll() {
+        let (addr, _, _, _) = spawn_mock_h2_server(vec![MockUpstreamReply::StreamChunks {
+            chunks: vec![Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\ndata: [DONE]\n\n")],
+            delay_ms: 0,
+        }]).await;
+        let state = make_test_app_state(&format!("http://{addr}/v1"), false, 1);
+        let start = Instant::now();
+        let response = handle_chat_completions(State(state.clone()), make_chat_req(true)).await;
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        let poll_started = start.elapsed();
+        axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+        let measured = Duration::from_micros(state.stats.total_ttft_us.load(Ordering::Relaxed));
+        assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 1);
+        assert!(measured + Duration::from_millis(90) < poll_started);
+    }
+
+    #[tokio::test]
+    async fn chat_ttft_excludes_buffered_empty_and_in_band_error_responses() {
+        let wire = b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"message\":\"generation failed\"}}\n\ndata: [DONE]\n\n";
+        for drop_at_done in [false, true] {
+            let (addr, _, _, _) = spawn_mock_h2_server(vec![MockUpstreamReply::StreamChunks {
+                chunks: vec![Bytes::from_static(wire)],
+                delay_ms: 0,
+            }]).await;
+            let state = make_test_app_state(&format!("http://{addr}/v1"), false, 1);
+            let response = handle_chat_completions(State(state.clone()), make_chat_req(true)).await;
+            if drop_at_done {
+                let mut body = response.into_body().into_data_stream();
+                let first = body.next().await.unwrap().unwrap();
+                assert_eq!(first.as_ref(), wire);
+                drop(body);
+            } else {
+                assert_eq!(axum::body::to_bytes(response.into_body(), 4096).await.unwrap().as_ref(), wire);
+            }
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
+        }
+        for (reply, stream) in [
+            (MockUpstreamReply::BufferedJson(Bytes::from_static(b"{\"choices\":[{\"message\":{\"content\":\"hello\"}}]}")), false),
+            (MockUpstreamReply::StreamChunks { chunks: vec![Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\ndata: [DONE]\n\n")], delay_ms: 0 }, true),
+        ] {
+            let (addr, _, _, _) = spawn_mock_h2_server(vec![reply]).await;
+            let state = make_test_app_state(&format!("http://{addr}/v1"), false, 1);
+            let response = handle_chat_completions(State(state.clone()), make_chat_req(stream)).await;
+            axum::body::to_bytes(response.into_body(), 4096).await.unwrap();
+            assert_eq!(state.stats.ttft_samples.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[test]
@@ -5833,29 +6153,18 @@ mod tests {
     }
 
     #[derive(Clone)]
-    enum MockUpstreamReply {
-        StreamChunks {
-            chunks: Vec<Bytes>,
-            delay_ms: u64,
-        },
-        StreamDelayedSchedule {
-            steps: Vec<(Bytes, Duration)>,
-        },
+    pub(super) enum MockUpstreamReply {
+        StreamChunks { chunks: Vec<Bytes>, delay_ms: u64 },
+        StreamDelayedSchedule { steps: Vec<(Bytes, Duration)> },
         BufferedJson(Bytes),
-        BufferedDelay {
-            body: Bytes,
-            delay: Duration,
-        },
+        BufferedDelay { body: Bytes, delay: Duration },
         BufferedReset,
-        StreamStallAfterFirst {
-            first: Bytes,
-            stall: Duration,
-        },
+        StreamStallAfterFirst { first: Bytes, stall: Duration },
         GoAwayEnhanceYourCalmPreHeader,
         GoAwayEnhanceYourCalmFirstChunk,
     }
 
-    async fn spawn_mock_h2_server(
+    pub(super) async fn spawn_mock_h2_server(
         replies: Vec<MockUpstreamReply>,
     ) -> (
         std::net::SocketAddr,
@@ -8116,10 +8425,11 @@ mod tests {
         assert_eq!(m_json["object"], "list");
         assert_eq!(m_json["data"].as_array().unwrap().len(), 2);
 
-        // B1: /v1/responses falls through to 404 fallback
+        // Unknown routes fall through to the 404 fallback. Mounted native
+        // routes are exercised separately through build_router.
         let fb_req = Request::builder()
             .method(Method::POST)
-            .uri("/v1/responses")
+            .uri("/v1/not-an-endpoint")
             .body(Body::empty())
             .unwrap();
         let fb_resp = handle_fallback(fb_req).await;
