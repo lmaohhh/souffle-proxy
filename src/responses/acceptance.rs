@@ -370,6 +370,8 @@ async fn native_h3_polled_disconnect_and_idle_timeout_release_slots() {
         let mut state = h3_state(fixture.addr);
         if idle_timeout {
             let slot = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().slots[0]).unwrap();
+            // The short deadline should measure an idle body, not a cold QUIC handshake.
+            slot.client.prewarm().await.unwrap();
             Arc::get_mut(&mut slot.config).unwrap().read_timeout = Duration::from_millis(100);
         }
         let response = build_router(state.clone())
