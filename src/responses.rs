@@ -721,24 +721,27 @@ pub(crate) async fn forward(
 }
 
 #[cfg(test)]
+mod acceptance;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Mutex;
 
     #[derive(Clone)]
-    struct Reply {
-        status: u16,
-        headers: Vec<(&'static str, &'static str)>,
-        chunks: Vec<Bytes>,
+    pub(super) struct Reply {
+        pub(super) status: u16,
+        pub(super) headers: Vec<(&'static str, &'static str)>,
+        pub(super) chunks: Vec<Bytes>,
     }
 
-    struct Captured {
-        path: String,
-        headers: HeaderMap,
-        body: Vec<u8>,
+    pub(super) struct Captured {
+        pub(super) path: String,
+        pub(super) headers: HeaderMap,
+        pub(super) body: Vec<u8>,
     }
 
-    async fn server(reply: Reply) -> (std::net::SocketAddr, Arc<Mutex<Vec<Captured>>>) {
+    pub(super) async fn server(reply: Reply) -> (std::net::SocketAddr, Arc<Mutex<Vec<Captured>>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -787,7 +790,7 @@ mod tests {
         (addr, captured)
     }
 
-    fn native_state(base: &str) -> Arc<AppState> {
+    pub(super) fn native_state(base: &str) -> Arc<AppState> {
         let mut state = crate::tests::make_test_app_state(base, true, 15);
         let slot = Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().slots[0]).unwrap();
         let config = Arc::get_mut(&mut slot.config).unwrap();
@@ -797,7 +800,7 @@ mod tests {
         state
     }
 
-    fn request(path: &str, body: &str) -> Request {
+    pub(super) fn request(path: &str, body: &str) -> Request {
         Request::builder()
             .method(Method::POST)
             .uri(path)
@@ -811,7 +814,7 @@ mod tests {
             .unwrap()
     }
 
-    fn completed() -> &'static str {
+    pub(super) fn completed() -> &'static str {
         "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":6},\"output_tokens_details\":{\"reasoning_tokens\":3}}}}\n\n"
     }
 
@@ -950,24 +953,26 @@ mod tests {
 
     #[test]
     fn native_sse_event_limit_is_independent_of_transport_chunks() {
-        let first = b"data: {\"type\":\"future.event\",\"text\":\"opaque\"}\n\n";
-        let last = b"data: {\"type\":\"response.completed\"}\n\n";
-        let source = [first.as_slice(), last.as_slice()].concat();
-        let limit = first.len().max(last.len());
-        for size in [1, 7, source.len()] {
-            let mut observation = Observation::default();
-            for chunk in source.chunks(size) {
-                observation.feed(chunk, limit);
+        for ending in ["\n", "\r\n", "\r"] {
+            let first = format!("data: {{\"type\":\"future.event\",{ending}data: \"text\":\"opaque\"}}{ending}{ending}");
+            let last = format!("data: {{\"type\":\"response.completed\"}}{ending}{ending}");
+            let source = format!("{first}{last}");
+            let limit = first.len().max(last.len());
+            for size in 1..=source.len() {
+                let mut observation = Observation::default();
+                for chunk in source.as_bytes().chunks(size) {
+                    observation.feed(chunk, limit);
+                }
+                assert!(!observation.malformed, "ending {ending:?}, chunk size {size}");
+                assert_eq!(observation.terminal, Terminal::Completed);
             }
-            assert!(!observation.malformed, "transport chunk size {size}");
-            assert_eq!(observation.terminal, Terminal::Completed);
-        }
-        for size in [1, source.len()] {
-            let mut observation = Observation::default();
-            for chunk in source.chunks(size) {
-                observation.feed(chunk, 16);
+            for size in 1..=source.len() {
+                let mut observation = Observation::default();
+                for chunk in source.as_bytes().chunks(size) {
+                    observation.feed(chunk, 16);
+                }
+                assert!(observation.malformed);
             }
-            assert!(observation.malformed);
         }
     }
 

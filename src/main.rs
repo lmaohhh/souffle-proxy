@@ -1529,6 +1529,49 @@ async fn handle_fallback(req: Request) -> Response {
     }
 }
 
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/health", get(handle_health))
+        .route("/", get(handle_health))
+        .route("/v1/models", get(handle_models))
+        .route("/models", get(handle_models))
+        .route("/stats", get(handle_stats))
+        .route(
+            "/v1/chat/completions",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/chat/completions",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .fallback(handle_fallback)
+        .with_state(state)
+}
+
 static HEALTH_JSON_BYTES: &[u8] =
     br#"{"engine":"h2-rust-async","provider":"souffle_proxy","status":"ok"}"#;
 
@@ -5263,46 +5306,7 @@ async fn main() {
         }
     });
 
-    let app = Router::new()
-        .route("/health", get(handle_health))
-        .route("/", get(handle_health))
-        .route("/v1/models", get(handle_models))
-        .route("/models", get(handle_models))
-        .route("/stats", get(handle_stats))
-        .route(
-            "/v1/chat/completions",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/chat/completions",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses/compact",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses/compact",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/v1/responses/input_tokens",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .route(
-            "/responses/input_tokens",
-            post(handle_chat_completions).options(handle_options),
-        )
-        .fallback(handle_fallback)
-        .with_state(state);
+    let app = build_router(state);
 
     let cfg0 = &slot_configs[0];
     log(
@@ -5342,10 +5346,11 @@ async fn main() {
     if slot_configs.len() > 1 {
         for (slot_idx, cfg) in slot_configs.iter().enumerate() {
             log(&format!(
-                "Slot {} ({}) → Preset: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
+                "Slot {} ({}) → Preset: {} | api_mode: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
                 slot_idx + 1,
                 if slot_idx == 0 { "deepseek-souffle" } else { "deepseek-sol" },
                 cfg.preset_name,
+                cfg.api_mode.as_str(),
                 if cfg.models.len() > 1 {
                     format!("{:?} (round-robin)", cfg.models)
                 } else {
@@ -5396,8 +5401,9 @@ async fn main() {
             None,
         );
     } else {
-        log(&format!("Preset: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
+        log(&format!("Preset: {} | api_mode: {} | model: {} | inject keys: {:?} | prepend_messages: {} | append_messages: {} | degen_repeat: {}",
             cfg0.preset_name,
+            cfg0.api_mode.as_str(),
             if cfg0.models.len() > 1 {
                 format!("{:?} (round-robin)", cfg0.models)
             } else {
@@ -8116,10 +8122,11 @@ mod tests {
         assert_eq!(m_json["object"], "list");
         assert_eq!(m_json["data"].as_array().unwrap().len(), 2);
 
-        // B1: /v1/responses falls through to 404 fallback
+        // Unknown routes fall through to the 404 fallback. Mounted native
+        // routes are exercised separately through build_router.
         let fb_req = Request::builder()
             .method(Method::POST)
-            .uri("/v1/responses")
+            .uri("/v1/not-an-endpoint")
             .body(Body::empty())
             .unwrap();
         let fb_resp = handle_fallback(fb_req).await;
