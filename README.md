@@ -35,7 +35,8 @@ guarantee instead of a hope.
 | `Client disconnected mid-stream` | Client dropped connection; proxy releases upstream slot immediately | n/a |
 
 - **Accurate stream accounting.** Every chunk and byte transferred across the wire is faithfully credited to `/stats` (`total_chunks`, `total_bytes`), even when a stream terminates prematurely due to upstream reset, idle timeout, or client disconnection.
-- **Strict routing with clear errors.** Unmatched endpoints or invalid methods return standard OpenAI-format `404 Not Found` JSON errors instead of swallowing typos with 200 OK health checks. Dead routes (`/v1/responses`, `/responses`) are pruned.
+- **Native stateless Responses.** GPT Responses presets use `api_mode: "responses"` and forward native HTTP/SSE items without converting them to Chat Completions. See the protocol contract below.
+- **Strict routing with clear errors.** Unmatched endpoints or invalid methods return standard OpenAI-format `404 Not Found` JSON errors instead of swallowing typos with 200 OK health checks.
 - **Knows when the client walked away.** A thread-safe (`Send + Sync`) atomic Drop guard inside the stream generator logs the
   disconnect, credits stats, frees the concurrency slot, and moves on.
 - **Caps everything that can grow.** Request bodies (64 MB default), upstream error bodies
@@ -56,6 +57,39 @@ guarantee instead of a hope.
   TLS SNI, and QUIC SNI all dial the bare address (never a bracket-wrapped one), and the HTTP/3 UDP socket binds the
   IPv6 wildcard (`[::]:0`) when the upstream is v6 — IPv4 keeps `0.0.0.0:0`. The QUIC socket also gets 1 MB
   send/receive buffers so big SSE bursts don't drop on the kernel floor.
+
+## Native Responses protocol
+
+Set `api_mode: "responses"` on a GPT preset. Existing presets default to
+`chat_completions`; sending one protocol to a preset configured for the other is
+a clear error, never a conversion. A Responses preset must have exactly one
+concrete `model`, one `key_env`, and one `upstream_bases` entry: rotating opaque
+reasoning across models or accounts would break continuation.
+
+The native HTTP endpoints are `POST /v1/responses`, `/v1/responses/compact`, and
+`/v1/responses/input_tokens` (unversioned aliases also work). Creation supports
+JSON and SSE. This change does not implement WebSocket transport. Auxiliary
+endpoints are forwarded only when the selected provider implements them.
+
+Create requests force `store: false`, merge `reasoning.summary: "detailed"`
+without discarding effort or other reasoning settings, and add
+`reasoning.encrypted_content` to the client's `include` list. Existing `input`
+items and unknown body fields keep their raw JSON values. Compact/token-count
+requests have their own schemas and do not inherit these create-only fields.
+
+Your client owns the history: it must replay the returned output items, including
+completed encrypted reasoning and tool-call items, in later requests. The proxy
+does not resolve stored IDs. Non-null `previous_response_id`/`conversation`,
+`item_reference`, background execution, and stored-response operations return
+clear errors. CoT folding, message prepend/append and repetition detection are
+always bypassed on the native path, even when enabled for chat.
+
+Native errors retain upstream status, body and relevant headers. Native requests
+are not automatically resubmitted after an ambiguous transport failure; the
+client owns retry decisions. Legitimate incoming client identity headers are
+preserved, while upstream authorization comes from the selected preset. SSE
+events are forwarded unchanged; typed terminal events and native usage populate
+`/stats`, and EOF before a terminal event breaks the downstream transfer.
 
 ## Quickstart
 

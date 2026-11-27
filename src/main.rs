@@ -41,6 +41,7 @@ use futures_util::StreamExt;
 use serde_json::{json, value::RawValue, Value};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
+mod responses;
 mod upstream;
 use upstream::{BodyStream, H2Client, H3Client, UpstreamClient, UpstreamError};
 
@@ -52,6 +53,7 @@ use upstream::{BodyStream, H2Client, H3Client, UpstreamClient, UpstreamError};
 #[derive(Debug, Clone)]
 struct Preset {
     name: String,
+    api_mode: responses::ApiMode,
     /// One or more upstream model ids. When multiple are given, the proxy
     /// round-robins across them per request (e.g. ["deepseek-sol", "souffle-pro"]).
     /// In config.json the field is called `model` (or `models`) and accepts
@@ -100,6 +102,8 @@ impl Preset {
         let obj = v
             .as_object()
             .ok_or_else(|| format!("preset '{name}' is not a JSON object"))?;
+        let api_mode = responses::ApiMode::parse(obj.get("api_mode"))
+            .map_err(|message| format!("preset '{name}' {message}"))?;
         // model: accept a single string or an array of strings, plus optional alias(es).
         let mut models: Vec<String> = match obj.get("models").or_else(|| obj.get("model")) {
             Some(Value::String(s)) => {
@@ -252,8 +256,15 @@ impl Preset {
         let prepend_raw = messages_to_raw_fragment(&prepend_messages)?;
         let append_raw = messages_to_raw_fragment(&append_messages)?;
 
+        if api_mode == responses::ApiMode::Responses
+            && (models.len() != 1 || key_envs.len() != 1 || upstream_bases.len() != 1)
+        {
+            return Err(format!("preset '{name}' api_mode responses requires exactly one model, key_env and upstream base to preserve encrypted-reasoning affinity"));
+        }
+
         Ok(Preset {
             name: name.to_string(),
+            api_mode,
             models,
             models_raw,
             key_envs,
@@ -396,6 +407,7 @@ fn exposed_models() -> Value {
 // ---------------------------------------------------------------------------
 #[derive(Debug, Clone)]
 struct Config {
+    api_mode: responses::ApiMode,
     host: String,
     port: u16,
     // Comma-joined failover list fed to H2Client (sticky-failover on connect fail).
@@ -584,6 +596,7 @@ impl Config {
             .collect();
 
         Config {
+            api_mode: preset.api_mode,
             host,
             port,
             upstream_bases: preset.upstream_bases.join(","),
@@ -742,6 +755,7 @@ struct ProxyStats {
     total_tokens_prompt: AtomicU64,
     total_tokens_completion: AtomicU64,
     total_tokens_reasoning: AtomicU64,
+    total_tokens_cached: AtomicU64,
     pub last_request_time: AtomicI64,
 }
 
@@ -760,6 +774,7 @@ impl ProxyStats {
             total_tokens_prompt: AtomicU64::new(0),
             total_tokens_completion: AtomicU64::new(0),
             total_tokens_reasoning: AtomicU64::new(0),
+            total_tokens_cached: AtomicU64::new(0),
             last_request_time: AtomicI64::new(jiff::Timestamp::now().as_second()),
         }
     }
@@ -788,6 +803,7 @@ impl ProxyStats {
                 "prompt": self.total_tokens_prompt.load(Ordering::Relaxed),
                 "completion": self.total_tokens_completion.load(Ordering::Relaxed),
                 "reasoning": self.total_tokens_reasoning.load(Ordering::Relaxed),
+                "cached": self.total_tokens_cached.load(Ordering::Relaxed),
             }
         })
     }
@@ -1495,6 +1511,8 @@ async fn handle_options() -> Response {
 async fn handle_fallback(req: Request) -> Response {
     if req.method() == Method::OPTIONS {
         handle_options().await
+    } else if responses::stored_operation(req.uri().path(), req.method()) {
+        make_error_response(StatusCode::BAD_REQUEST, "This proxy provides stateless Responses only; stored-response operations are unavailable")
     } else {
         let method = req.method().clone();
         let path = req.uri().path().to_string();
@@ -1572,6 +1590,7 @@ async fn handle_chat_completions(State(state): State<Arc<AppState>>, request: Re
 
     state.stats.total_requests.fetch_add(1, Ordering::Relaxed);
     let active_guard = ActiveRequestGuard::new(state.stats.clone());
+    let options = responses::RequestOptions::capture(&request);
 
     // Reject an oversized body before buffering it at all. A streaming request with
     // no Content-Length is still capped below by the bounded read; this just fails
@@ -1623,7 +1642,11 @@ async fn handle_chat_completions(State(state): State<Arc<AppState>>, request: Re
         .stats
         .last_request_time
         .store(jiff::Timestamp::now().as_second(), Ordering::Relaxed);
-    chat_completions_raw_path(state, raw_bytes, raw_len, req_id, t_start, active_guard).await
+    if options.operation.native() {
+        responses::raw_path(state, raw_bytes, req_id, t_start, active_guard, options).await
+    } else {
+        chat_completions_raw_path(state, raw_bytes, raw_len, req_id, t_start, active_guard).await
+    }
 }
 
 /// Select the slot index based on the client's requested model string.
@@ -1711,6 +1734,10 @@ async fn chat_completions_raw_path(
         );
     }
     let preset = state.slots[slot_idx].clone();
+    if preset.config.api_mode != responses::ApiMode::ChatCompletions {
+        state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+        return make_error_response(StatusCode::BAD_REQUEST, "Selected preset uses Responses; send a native /v1/responses request instead of Chat Completions");
+    }
 
     for (k, v) in preset.config.inject_raw.iter() {
         match k.as_str() {
@@ -1847,6 +1874,7 @@ async fn chat_completions_raw_path(
         t_start,
         permit,
         active_guard,
+        responses::RequestOptions::default(),
     )
     .await
 }
@@ -3137,6 +3165,7 @@ async fn dispatch_upstream(
     t_start: Instant,
     permit: OwnedSemaphorePermit,
     active_guard: ActiveRequestGuard,
+    options: responses::RequestOptions,
 ) -> Response {
     let cot_active = preset.config.souffle_pout
         || preset.config.prepend_raw.is_some()
@@ -3167,7 +3196,15 @@ async fn dispatch_upstream(
     const MAX_FREE_RETRIES: u32 = 8;
     let mut free_retries: u32 = 0;
 
-    while attempt < preset.config.max_retry {
+    // A native Responses request may execute hosted tools before a transport
+    // failure. Never silently resubmit an ambiguously accepted generation.
+    let max_retry = if options.operation.native() {
+        1
+    } else {
+        preset.config.max_retry
+    };
+
+    while attempt < max_retry {
         let t_dispatch = Instant::now();
         if attempt > 0 && preset.config.models.len() > 1 {
             let next_idx =
@@ -3237,9 +3274,22 @@ async fn dispatch_upstream(
             hdrs[idx].clone()
         };
 
+        let uri = match options.uri(target) {
+            Ok(uri) => uri,
+            Err(message) => return make_error_response(StatusCode::BAD_REQUEST, &message),
+        };
+        let user_agent = if options.operation.native() {
+            options
+                .headers
+                .get(header::USER_AGENT)
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("souffle_proxy"))
+        } else {
+            HeaderValue::from_static("curl/8.0.0")
+        };
         let mut req_builder = http::Request::builder()
             .method(Method::POST)
-            .uri(target.chat_uri.clone())
+            .uri(uri)
             .header(header::AUTHORIZATION, auth_hdr)
             .header(
                 header::CONTENT_TYPE,
@@ -3253,7 +3303,7 @@ async fn dispatch_upstream(
                     HeaderValue::from_static("application/json")
                 },
             )
-            .header(header::USER_AGENT, HeaderValue::from_static("curl/8.0.0"))
+            .header(header::USER_AGENT, user_agent)
             .header("X-Accel-Buffering", HeaderValue::from_static("no"))
             .header(
                 header::CACHE_CONTROL,
@@ -3266,6 +3316,18 @@ async fn dispatch_upstream(
             )
             .header(header::PRAGMA, HeaderValue::from_static("no-cache"))
             .header(header::EXPIRES, HeaderValue::from_static("0"));
+
+        if options.operation.native() {
+            req_builder = req_builder.header(
+                header::ACCEPT_ENCODING,
+                HeaderValue::from_static("identity"),
+            );
+            for (name, value) in &options.headers {
+                if name != header::USER_AGENT {
+                    req_builder = req_builder.header(name, value);
+                }
+            }
+        }
 
         req_builder = req_builder.header(
             header::CONTENT_LENGTH,
@@ -3289,6 +3351,58 @@ async fn dispatch_upstream(
         };
 
         let send_res = tokio::time::timeout(send_timeout, preset.client.send_stream(req)).await;
+        // Native responses retain their own error envelopes, headers and retry
+        // semantics. Nothing below this branch may inspect or replay them as chat.
+        if options.operation.native() {
+            return match send_res {
+                Ok(Ok(response)) => {
+                    let ttft = t_dispatch.elapsed().as_secs_f64();
+                    state
+                        .stats
+                        .total_ttft_us
+                        .fetch_add((ttft * 1_000_000.0) as u64, Ordering::Relaxed);
+                    state.stats.ttft_samples.fetch_add(1, Ordering::Relaxed);
+                    responses::forward(
+                        response.status,
+                        response.headers,
+                        response.body,
+                        state.clone(),
+                        preset.clone(),
+                        options.operation,
+                        is_stream,
+                        req_id,
+                        ttft,
+                        t_start,
+                        permit,
+                        active_guard,
+                    )
+                    .await
+                }
+                Ok(Err(error)) => {
+                    if let Some(conn_id) = error.conn_id {
+                        if !is_terminal_upstream_error(&error.error) {
+                            if error.error.is_stream_scoped() {
+                                preset.client.invalidate_stream_if_same(conn_id).await;
+                            } else {
+                                preset.client.invalidate_if_same(conn_id).await;
+                            }
+                        }
+                    }
+                    state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                    make_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        &format!("Responses upstream transport failed: {}", error.error),
+                    )
+                }
+                Err(_) => {
+                    state.stats.error_count.fetch_add(1, Ordering::Relaxed);
+                    make_error_response(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "Responses upstream request timed out",
+                    )
+                }
+            };
+        }
         match send_res {
             Ok(Ok(upstream_resp)) => {
                 let conn_id = upstream_resp.conn_id;
@@ -3299,9 +3413,7 @@ async fn dispatch_upstream(
                 // Retryable upstream statuses. Matches the Python shim's set:
                 // 429/500-504/524 plus 522 (CF could not reach the origin) and
                 // 529 (origin overloaded) -- both are transient, not client errors.
-                if is_retryable_upstream_status(status_u16)
-                    && attempt < preset.config.max_retry - 1
-                {
+                if is_retryable_upstream_status(status_u16) && attempt < max_retry - 1 {
                     let err_preview = match tokio::time::timeout(
                         ERROR_BODY_TIMEOUT,
                         upstream_resp.body.read_full_limited(ERROR_BODY_CAP),
@@ -3428,7 +3540,7 @@ async fn dispatch_upstream(
                                         Some(&req_id),
                                     );
                                     preset.client.invalidate_stream_if_same(conn_id).await;
-                                    if attempt < preset.config.max_retry - 1 {
+                                    if attempt < max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt);
                                         log(
@@ -3477,7 +3589,7 @@ async fn dispatch_upstream(
                                     } else {
                                         preset.client.invalidate_if_same(conn_id).await;
                                     }
-                                    if attempt < preset.config.max_retry - 1 {
+                                    if attempt < max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt) * 2;
                                         log(
@@ -3547,7 +3659,7 @@ async fn dispatch_upstream(
                                     } else {
                                         preset.client.invalidate_if_same(conn_id).await;
                                     }
-                                    if attempt < preset.config.max_retry - 1 {
+                                    if attempt < max_retry - 1 {
                                         drop(stream);
                                         let delay = retry_delay(attempt);
                                         log(
@@ -3579,7 +3691,7 @@ async fn dispatch_upstream(
                                 ),
                                 Some(&req_id),
                             );
-                            if attempt < preset.config.max_retry - 1 {
+                            if attempt < max_retry - 1 {
                                 drop(stream);
                                 let delay = retry_delay(attempt);
                                 log(
@@ -3612,7 +3724,7 @@ async fn dispatch_upstream(
                     }
 
                     if is_empty {
-                        if attempt < preset.config.max_retry - 1 {
+                        if attempt < max_retry - 1 {
                             drop(stream);
                             let delay = retry_delay(attempt);
                             log(
@@ -3654,7 +3766,7 @@ async fn dispatch_upstream(
                                 ),
                                 Some(&req_id),
                             );
-                            if attempt < preset.config.max_retry - 1 {
+                            if attempt < max_retry - 1 {
                                 drop(stream);
                                 let delay = retry_delay(attempt);
                                 log(
@@ -3725,7 +3837,7 @@ async fn dispatch_upstream(
                                 preset.client.invalidate_if_same(conn_id).await;
                             }
                             log(&format!("Upstream body read error: {}", e), Some(&req_id));
-                            if attempt < preset.config.max_retry - 1 {
+                            if attempt < max_retry - 1 {
                                 let delay = retry_delay(attempt);
                                 log(
                                     &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -3749,7 +3861,7 @@ async fn dispatch_upstream(
                                 ),
                                 Some(&req_id),
                             );
-                            if attempt < preset.config.max_retry - 1 {
+                            if attempt < max_retry - 1 {
                                 let delay = retry_delay(attempt);
                                 log(
                                     &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -3799,7 +3911,7 @@ async fn dispatch_upstream(
                             "Degenerate repetition loop detected in buffered response. Treating as retryable failure.",
                             Some(&req_id),
                         );
-                        if attempt < preset.config.max_retry - 1 {
+                        if attempt < max_retry - 1 {
                             let delay = retry_delay(attempt);
                             log(
                                 &format!(
@@ -3877,7 +3989,7 @@ async fn dispatch_upstream(
                         if let Some(cid) = failed_conn_id {
                             preset.client.invalidate_stream_if_same(cid).await;
                         }
-                        if attempt < preset.config.max_retry - 1 {
+                        if attempt < max_retry - 1 {
                             let delay = retry_delay(attempt);
                             log(
                                 &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -3923,7 +4035,7 @@ async fn dispatch_upstream(
                                 preset.client.invalidate_if_same(cid).await;
                             }
                         }
-                        if attempt < preset.config.max_retry - 1 {
+                        if attempt < max_retry - 1 {
                             let delay = retry_delay(attempt) * 2;
                             log(
                                 &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -3988,7 +4100,7 @@ async fn dispatch_upstream(
                                 preset.client.invalidate_if_same(cid).await;
                             }
                         }
-                        if attempt < preset.config.max_retry - 1 {
+                        if attempt < max_retry - 1 {
                             let delay = retry_delay(attempt);
                             log(
                                 &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -4018,7 +4130,7 @@ async fn dispatch_upstream(
                 // reporting ready; drop it so the retry dials fresh (mirrors the
                 // Ok(Err) branch, which invalidates on transport failure).
                 preset.client.invalidate_connection().await;
-                if attempt < preset.config.max_retry - 1 {
+                if attempt < max_retry - 1 {
                     let delay = retry_delay(attempt);
                     log(
                         &format!("Auto-retry in {:.1}s...", delay.as_secs_f64()),
@@ -4829,6 +4941,7 @@ fn questionnaire() -> Preset {
     let models_raw = models_to_raw(&models).unwrap_or_default();
     let preset = Preset {
         name,
+        api_mode: responses::ApiMode::ChatCompletions,
         models,
         models_raw,
         key_envs,
@@ -4886,6 +4999,11 @@ fn write_preset_to_config(preset: &Preset) -> Result<(), String> {
         .filter(Value::is_object)
         .unwrap_or_else(|| json!({}));
     preset_obj["name"] = json!(preset.name);
+    preset_obj
+        .as_object_mut()
+        .unwrap()
+        .entry("api_mode")
+        .or_insert_with(|| json!(preset.api_mode.as_str()));
     preset_obj["model"] = if preset.models.len() == 1 {
         json!(preset.models[0])
     } else {
@@ -5157,6 +5275,30 @@ async fn main() {
         )
         .route(
             "/chat/completions",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/compact",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/v1/responses/input_tokens",
+            post(handle_chat_completions).options(handle_options),
+        )
+        .route(
+            "/responses/input_tokens",
             post(handle_chat_completions).options(handle_options),
         )
         .fallback(handle_fallback)
@@ -5899,7 +6041,7 @@ mod tests {
         (addr, attempts, chunks_sent, reset_observed)
     }
 
-    fn make_test_app_state(
+    pub(super) fn make_test_app_state(
         upstream_base: &str,
         degen_repeat: bool,
         max_retry: usize,
@@ -5907,6 +6049,7 @@ mod tests {
         let models = vec!["test-model".to_string()];
         let models_raw = models_to_raw(&models).unwrap();
         let config = Arc::new(Config {
+            api_mode: responses::ApiMode::ChatCompletions,
             host: "127.0.0.1".to_string(),
             port: 0,
             upstream_bases: upstream_base.to_string(),
