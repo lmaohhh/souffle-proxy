@@ -171,12 +171,17 @@ fn reject_stored_context(map: &BTreeMap<String, Box<RawValue>>) -> Result<(), St
             for item in items {
                 if let Ok(fields) = serde_json::from_str::<BTreeMap<String, &RawValue>>(item.get())
                 {
-                    if fields
+                    let explicit_reference = fields
                         .get("type")
                         .and_then(|v| serde_json::from_str::<String>(v.get()).ok())
                         .as_deref()
-                        == Some("item_reference")
-                    {
+                        == Some("item_reference");
+                    // ItemReference.type is optional. A complete implicit
+                    // message may also have an id, so retain role/content items.
+                    let implicit_reference = fields.contains_key("id")
+                        && fields.get("type").is_none_or(|v| v.get().trim() == "null")
+                        && !(fields.contains_key("role") && fields.contains_key("content"));
+                    if explicit_reference || implicit_reference {
                         return Err("Stateless Responses cannot resolve item_reference; send the complete item".into());
                     }
                 }
@@ -353,9 +358,9 @@ struct NativeUsage {
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
     #[serde(default)]
-    input_tokens_details: TokenDetails,
+    input_tokens_details: Option<TokenDetails>,
     #[serde(default)]
-    output_tokens_details: TokenDetails,
+    output_tokens_details: Option<TokenDetails>,
 }
 
 // Only observe metadata. In particular, deserialization skips the potentially
@@ -409,33 +414,48 @@ impl Observation {
             self.usage = Some(UsageStats {
                 prompt_tokens: usage.input_tokens,
                 completion_tokens: usage.output_tokens,
-                reasoning_tokens: usage.output_tokens_details.reasoning_tokens,
+                reasoning_tokens: usage
+                    .output_tokens_details
+                    .as_ref()
+                    .and_then(|v| v.reasoning_tokens),
                 completion_tokens_details: None,
             });
-            self.cached = usage.input_tokens_details.cached_tokens.unwrap_or(0);
+            self.cached = usage
+                .input_tokens_details
+                .as_ref()
+                .and_then(|v| v.cached_tokens)
+                .unwrap_or(0);
         }
     }
 
-    fn feed(&mut self, chunk: &[u8], limit: usize) {
+    fn feed(&mut self, mut chunk: &[u8], limit: usize) {
         if self.malformed {
             return;
         }
-        if self.buffer.len().saturating_add(chunk.len()) > limit {
-            self.malformed = true;
-            self.buffer.clear();
-            self.data.clear();
-            return;
-        }
-        self.buffer.extend_from_slice(chunk);
-        while let Some(end) = memchr::memchr2(b'\n', b'\r', &self.buffer) {
-            let terminator = self.buffer[end];
-            let line = self.buffer.split_to(end + 1);
-            if self.skip_lf && end == 0 && terminator == b'\n' {
+        while !chunk.is_empty() {
+            // Bound unfinished lines and event data, not transport chunks:
+            // one H2/H3 read can contain arbitrarily many complete events.
+            let end = memchr::memchr2(b'\n', b'\r', chunk);
+            let len = end.map_or(chunk.len(), |end| end + 1);
+            if self.buffer.len().saturating_add(len) > limit {
+                self.malformed = true;
+                self.buffer.clear();
+                self.data.clear();
+                return;
+            }
+            self.buffer.extend_from_slice(&chunk[..len]);
+            chunk = &chunk[len..];
+            if end.is_none() {
+                return;
+            }
+            let line = self.buffer.split_to(self.buffer.len());
+            let terminator = line[line.len() - 1];
+            let line = &line[..line.len() - 1];
+            if self.skip_lf && line.is_empty() && terminator == b'\n' {
                 self.skip_lf = false;
                 continue;
             }
             self.skip_lf = terminator == b'\r';
-            let line = &line[..end];
             if line.is_empty() {
                 if !self.data.is_empty() {
                     let data = std::mem::take(&mut self.data);
@@ -684,13 +704,13 @@ pub(crate) async fn forward(
                 }
                 Err(_) => { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Responses stream idle timeout")); break; }
             };
-            metrics.chunks.fetch_add(1, Ordering::Relaxed); metrics.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             observation.feed(&chunk, preset.config.max_body_bytes);
+            if observation.malformed { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Responses SSE event exceeded max_body_bytes")); break; }
+            metrics.chunks.fetch_add(1, Ordering::Relaxed); metrics.bytes.fetch_add(chunk.len() as u64, Ordering::Relaxed);
             if let Some(usage) = &observation.usage { publish_sse_usage(usage, &metrics); }
             cached.store(observation.cached, Ordering::Relaxed);
             terminal.store(observation.terminal as u8, Ordering::Relaxed);
             yield Ok::<Bytes, std::io::Error>(chunk);
-            if observation.malformed { terminal.store(2, Ordering::Relaxed); yield Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Responses SSE event exceeded max_body_bytes")); break; }
             if observation.terminal != Terminal::Pending { break; }
         }
     };
@@ -926,6 +946,136 @@ mod tests {
                 assert_eq!(uri.host(), Some("example.test"));
             }
         }
+    }
+
+    #[test]
+    fn native_sse_event_limit_is_independent_of_transport_chunks() {
+        let first = b"data: {\"type\":\"future.event\",\"text\":\"opaque\"}\n\n";
+        let last = b"data: {\"type\":\"response.completed\"}\n\n";
+        let source = [first.as_slice(), last.as_slice()].concat();
+        let limit = first.len().max(last.len());
+        for size in [1, 7, source.len()] {
+            let mut observation = Observation::default();
+            for chunk in source.chunks(size) {
+                observation.feed(chunk, limit);
+            }
+            assert!(!observation.malformed, "transport chunk size {size}");
+            assert_eq!(observation.terminal, Terminal::Completed);
+        }
+        for size in [1, source.len()] {
+            let mut observation = Observation::default();
+            for chunk in source.chunks(size) {
+                observation.feed(chunk, 16);
+            }
+            assert!(observation.malformed);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_oversized_sse_chunk_is_rejected_before_forwarding() {
+        let wire = format!(
+            "data: {{\"type\":\"future.event\",\"text\":\"{}\"}}\n\n",
+            "x".repeat(256)
+        );
+        let (addr, _) = server(Reply {
+            status: 200,
+            headers: vec![("content-type", "text/event-stream")],
+            chunks: vec![Bytes::from(wire)],
+        })
+        .await;
+        let mut state = native_state(&format!("http://{addr}/v1"));
+        Arc::get_mut(
+            &mut Arc::get_mut(&mut Arc::get_mut(&mut state).unwrap().slots[0])
+                .unwrap()
+                .config,
+        )
+        .unwrap()
+        .max_body_bytes = 64;
+        let response = handle_chat_completions(
+            State(state.clone()),
+            request("/v1/responses", r#"{"input":"hello","stream":true}"#),
+        )
+        .await;
+        let mut body = response.into_body().into_data_stream();
+        assert!(matches!(body.next().await, Some(Err(_))));
+        drop(body);
+        assert_eq!(state.stats.total_bytes.load(Ordering::Relaxed), 0);
+        assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 1);
+        assert_eq!(state.stats.active_requests.load(Ordering::Relaxed), 0);
+        assert_eq!(state.semaphore.available_permits(), 20);
+    }
+
+    #[tokio::test]
+    async fn native_nullable_usage_details_preserve_terminal_and_wire_bytes() {
+        let body = r#"{"status":"completed","output":[],"usage":{"input_tokens":10,"output_tokens":4,"input_tokens_details":null,"output_tokens_details":null}}"#;
+        for stream in [false, true] {
+            let wire = if stream {
+                format!("data: {{\"type\":\"response.completed\",\"response\":{body}}}\n\n")
+            } else {
+                body.to_owned()
+            };
+            let (addr, _) = server(Reply {
+                status: 200,
+                headers: vec![(
+                    "content-type",
+                    if stream {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                )],
+                chunks: vec![Bytes::from(wire.clone())],
+            })
+            .await;
+            let state = native_state(&format!("http://{addr}/v1"));
+            let response = handle_chat_completions(
+                State(state.clone()),
+                request(
+                    "/v1/responses",
+                    &format!(r#"{{"input":"hello","stream":{stream}}}"#),
+                ),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                axum::body::to_bytes(response.into_body(), 4096)
+                    .await
+                    .unwrap(),
+                wire
+            );
+            assert_eq!(state.stats.success_count.load(Ordering::Relaxed), 1);
+            assert_eq!(state.stats.error_count.load(Ordering::Relaxed), 0);
+            assert_eq!(state.stats.total_tokens_prompt.load(Ordering::Relaxed), 10);
+            assert_eq!(
+                state.stats.total_tokens_completion.load(Ordering::Relaxed),
+                4
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_implicit_item_references_are_rejected_before_dispatch() {
+        let (addr, captured) = server(Reply {
+            status: 200,
+            headers: vec![("content-type", "application/json")],
+            chunks: vec![Bytes::from_static(br#"{"status":"completed"}"#)],
+        })
+        .await;
+        let state = native_state(&format!("http://{addr}/v1"));
+        for body in [
+            r#"{"input":[{"id":"msg_old"}]}"#,
+            r#"{"input":[{"id":"rs_old","type":null}]}"#,
+        ] {
+            let response =
+                handle_chat_completions(State(state.clone()), request("/v1/responses", body)).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        }
+        assert!(captured.lock().unwrap().is_empty());
+        let source = r#"{"input":[ {"id":"msg_full","role":"assistant","content":"hello"}, {"id":"rs_full","type":"reasoning","encrypted_content":"OPAQUE","summary":[]} ]}"#;
+        let map: BTreeMap<String, Box<RawValue>> = serde_json::from_str(source).unwrap();
+        let original = map["input"].get().to_owned();
+        let (payload, _) = prepare_payload(map, &state.slots[0].config, Operation::Create).unwrap();
+        assert_eq!(payload.map["input"].get(), original);
     }
 
     #[test]
