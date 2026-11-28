@@ -46,6 +46,111 @@ mod upstream;
 use upstream::{BodyStream, H2Client, H3Client, UpstreamClient, UpstreamError};
 
 // ---------------------------------------------------------------------------
+// Preset header metadata. Values are parsed once at startup and deliberately
+// redacted from Debug output; only safe, non-framing metadata reaches dispatch.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Default)]
+struct HeaderOverrides {
+    entries: Vec<(HeaderName, HeaderValue)>,
+}
+
+impl std::fmt::Debug for HeaderOverrides {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HeaderOverrides")
+            .field("names", &self.entries.iter().map(|(name, _)| name).collect::<Vec<_>>())
+            .field("count", &self.entries.len())
+            .finish()
+    }
+}
+
+impl HeaderOverrides {
+    fn parse(preset_name: &str, value: &Value) -> Result<Self, String> {
+        let object = value.as_object().ok_or_else(|| {
+            format!("preset '{preset_name}' field 'extra_headers' must be a JSON object")
+        })?;
+        let mut entries = Vec::with_capacity(object.len());
+        let mut seen = HashSet::with_capacity(object.len());
+        for (configured_name, configured_value) in object {
+            let name = HeaderName::from_bytes(configured_name.as_bytes()).map_err(|error| {
+                format!(
+                    "preset '{preset_name}' field 'extra_headers' has invalid HTTP name '{configured_name}': {error}"
+                )
+            })?;
+            let normalized = name.as_str().to_ascii_lowercase();
+            if !seen.insert(normalized) {
+                return Err(format!(
+                    "preset '{preset_name}' field 'extra_headers' has case-colliding header name '{configured_name}'"
+                ));
+            }
+            if is_protected_extra_header(&name) {
+                return Err(format!(
+                    "preset '{preset_name}' field 'extra_headers' header '{configured_name}' is protected"
+                ));
+            }
+            let configured_value = configured_value.as_str().ok_or_else(|| {
+                format!(
+                    "preset '{preset_name}' field 'extra_headers' value for '{configured_name}' must be a string"
+                )
+            })?;
+            let value = HeaderValue::from_str(configured_value).map_err(|error| {
+                format!(
+                    "preset '{preset_name}' field 'extra_headers' value for '{configured_name}' is not a valid HTTP value: {error}"
+                )
+            })?;
+            entries.push((name, value));
+        }
+        Ok(Self { entries })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn apply(&self, headers: &mut HeaderMap) {
+        for (name, value) in &self.entries {
+            headers.insert(name.clone(), value.clone());
+        }
+    }
+}
+
+fn is_protected_extra_header(name: &HeaderName) -> bool {
+    matches!(
+        name.as_str(),
+        "host"
+            | "authorization"
+            | "proxy-authorization"
+            | "proxy-authenticate"
+            | "www-authenticate"
+            | "x-api-key"
+            | "api-key"
+            | "cookie"
+            | "set-cookie"
+            | "content-length"
+            | "content-type"
+            | "content-encoding"
+            | "accept"
+            | "accept-encoding"
+            | "connection"
+            | "transfer-encoding"
+            | "keep-alive"
+            | "te"
+            | "trailer"
+            | "upgrade"
+            | "cache-control"
+            | "pragma"
+            | "expires"
+            | "cdn-cache-control"
+            | "cloudflare-cdn-cache-control"
+            | "x-accel-buffering"
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Preset system: config.json beside the exe holds named presets. A preset is
 // RAW PARAMS — the proxy is a dumb merger that splices `inject` verbatim into
 // each request body (it knows no model families). Local docs/PRESETS.md is deliberately gitignored; see README.md.
@@ -94,6 +199,8 @@ struct Preset {
     /// In-Content CoT folding (`souffle_pout`): folds assistant reasoning_content
     /// into <think> tags in content. Absent/false = off; true = on.
     pub souffle_pout: bool,
+    /// Safe, per-preset metadata overrides applied after all request headers are assembled.
+    extra_headers: HeaderOverrides,
 }
 
 impl Preset {
@@ -251,6 +358,10 @@ impl Preset {
             Some(_) => return Err(format!("preset '{name}' field 'http3' must be a boolean")),
             None => None,
         };
+        let extra_headers = match obj.get("extra_headers") {
+            Some(value) => HeaderOverrides::parse(name, value)?,
+            None => HeaderOverrides::default(),
+        };
         let inject_raw = inject_to_raw(&inject)?;
         let models_raw = models_to_raw(&models)?;
         let prepend_raw = messages_to_raw_fragment(&prepend_messages)?;
@@ -279,6 +390,7 @@ impl Preset {
             brotli,
             http3,
             souffle_pout,
+            extra_headers,
         })
     }
 }
@@ -462,6 +574,8 @@ struct Config {
     /// Opt-in HTTP/3 (QUIC / RFC 9114) transport engine:
     /// true = use HTTP/3 client; false = use HTTP/2 client.
     pub http3_enabled: bool,
+    /// Safe, per-preset metadata overrides applied at the single late dispatch point.
+    extra_headers: HeaderOverrides,
 }
 
 /// Timeout from an env var parsed as f64 seconds. Negative, non-finite, or
@@ -623,6 +737,7 @@ impl Config {
             prepend_raw: preset.prepend_raw.clone(),
             souffle_pout,
             http3_enabled,
+            extra_headers: preset.extra_headers.clone(),
         }
     }
 }
@@ -3551,7 +3666,7 @@ async fn dispatch_upstream(
                 req_builder.header(header::CONTENT_ENCODING, HeaderValue::from_static("br"));
         }
 
-        let req = match req_builder.body(outbound.bytes.clone()) {
+        let mut req = match req_builder.body(outbound.bytes.clone()) {
             Ok(r) => r,
             Err(e) => {
                 state.stats.error_count.fetch_add(1, Ordering::Relaxed);
@@ -3561,6 +3676,9 @@ async fn dispatch_upstream(
                 );
             }
         };
+        // One late replacement point covers built-in, caller/native, framing and
+        // compression headers for every operation and transport.
+        preset.config.extra_headers.apply(req.headers_mut());
 
         let send_res = tokio::time::timeout(send_timeout, preset.client.send_stream(req)).await;
         // Native responses retain their own error envelopes, headers and retry
@@ -5196,6 +5314,7 @@ fn questionnaire() -> Preset {
         brotli: None,
         http3: None,
         souffle_pout: false,
+        extra_headers: HeaderOverrides::default(),
     };
     if let Err(e) = write_preset_to_config(&preset) {
         eprintln!("[WARN] Could not write config.json: {e}");
@@ -6358,10 +6477,63 @@ mod tests {
         (addr, attempts, chunks_sent, reset_observed)
     }
 
+    async fn spawn_header_capture_h2_server() -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<HeaderMap>>>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_server = captured.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let captured = captured_server.clone();
+                tokio::spawn(async move {
+                    let Ok(mut connection) = h2::server::handshake(tcp).await else {
+                        return;
+                    };
+                    while let Some(Ok((request, mut respond))) = connection.accept().await {
+                        captured.lock().unwrap().push(request.headers().clone());
+                        let mut body = request.into_body();
+                        while let Some(Ok(frame)) = body.data().await {
+                            let _ = body.flow_control().release_capacity(frame.len());
+                        }
+                        let response = http::Response::builder()
+                            .status(200)
+                            .header("content-type", "application/json")
+                            .body(())
+                            .unwrap();
+                        if let Ok(mut send) = respond.send_response(response, false) {
+                            let _ = send.send_data(
+                                Bytes::from_static(br#"{"status":"completed","output":[]}"#),
+                                true,
+                            );
+                        }
+                    }
+                });
+            }
+        });
+        (addr, captured)
+    }
+
     pub(super) fn make_test_app_state(
         upstream_base: &str,
         degen_repeat: bool,
         max_retry: usize,
+    ) -> Arc<AppState> {
+        make_test_app_state_with_headers(
+            upstream_base,
+            degen_repeat,
+            max_retry,
+            HeaderOverrides::default(),
+        )
+    }
+
+    fn make_test_app_state_with_headers(
+        upstream_base: &str,
+        degen_repeat: bool,
+        max_retry: usize,
+        extra_headers: HeaderOverrides,
     ) -> Arc<AppState> {
         let models = vec!["test-model".to_string()];
         let models_raw = models_to_raw(&models).unwrap();
@@ -6393,6 +6565,7 @@ mod tests {
             prepend_raw: None,
             souffle_pout: false,
             http3_enabled: false,
+            extra_headers,
         });
         let client = UpstreamClient::H2(
             H2Client::new(
@@ -6825,6 +6998,215 @@ mod tests {
             p.models,
             vec!["deepseek-sol".to_string(), "souffle-pro".to_string()]
         );
+    }
+
+    #[test]
+    fn preset_extra_headers_schema_is_strict_and_absent_is_empty() {
+        let bare = json!({
+            "model": "m",
+            "upstream_bases": ["https://x.invalid/v1"]
+        });
+        let parsed = Preset::from_value("bare", &bare).unwrap();
+        assert!(parsed.extra_headers.is_empty());
+
+        let valid = json!({
+            "model": "m",
+            "upstream_bases": ["https://x.invalid/v1"],
+            "extra_headers": {
+                "User-Agent": "codex_cli_rs/0.87.0",
+                "originator": "codex_cli_rs",
+                "x-route-hint": "sol"
+            }
+        });
+        let parsed = Preset::from_value("valid", &valid).unwrap();
+        assert_eq!(parsed.extra_headers.len(), 3);
+        let debug = format!("{parsed:?}");
+        assert!(debug.contains("extra_headers"));
+        assert!(!debug.contains("codex_cli_rs/0.87.0"));
+        assert!(!debug.contains("sol"));
+
+        let invalid = [
+            json!(null),
+            json!([]),
+            json!({"x-route-hint": 7}),
+            json!({"x\n-route-hint": "bad-name"}),
+            json!({"x-route-hint": "bad\n-value"}),
+            json!({"Host": "upstream.example"}),
+            json!({"User-Agent": "one", "user-agent": "two"}),
+        ];
+        for extra_headers in invalid {
+            let mut object = bare.clone();
+            object["extra_headers"] = extra_headers;
+            let error = Preset::from_value("invalid", &object).unwrap_err();
+            assert!(error.contains("preset 'invalid'"), "missing preset context: {error}");
+            assert!(error.contains("extra_headers"), "missing field context: {error}");
+        }
+    }
+
+    #[test]
+    fn preset_extra_headers_reject_auth_and_framing_fields() {
+        for field in [
+            "authorization",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "www-authenticate",
+            "x-api-key",
+            "api-key",
+            "cookie",
+            "set-cookie",
+            "content-length",
+            "content-type",
+            "content-encoding",
+            "accept",
+            "accept-encoding",
+            "connection",
+            "transfer-encoding",
+            "keep-alive",
+            "te",
+            "trailer",
+            "upgrade",
+            "cache-control",
+            "pragma",
+            "expires",
+            "cdn-cache-control",
+            "cloudflare-cdn-cache-control",
+            "x-accel-buffering",
+        ] {
+            let value = json!({
+                "model": "m",
+                "upstream_bases": ["https://x.invalid/v1"],
+                "extra_headers": {field: "must-not-be-configurable"}
+            });
+            let error = Preset::from_value("protected", &value).unwrap_err();
+            assert!(error.contains("extra_headers"), "missing field context: {error}");
+            assert!(error.contains(field), "missing protected field context: {error}");
+        }
+    }
+
+    #[test]
+    fn preset_extra_headers_pseudo_headers_are_rejected() {
+        let value = json!({
+            "model": "m",
+            "upstream_bases": ["https://x.invalid/v1"],
+            "extra_headers": {":path": "/not-a-header"}
+        });
+        let error = Preset::from_value("pseudo", &value).unwrap_err();
+        assert!(error.contains("preset 'pseudo'"));
+        assert!(error.contains("extra_headers"));
+        assert!(error.contains(":path"));
+    }
+
+    #[test]
+    fn extra_headers_late_override_replaces_caller_identity_without_disclosing_values() {
+        let mut headers = HeaderMap::new();
+        headers.append(header::USER_AGENT, HeaderValue::from_static("python-sdk/2.54.0"));
+        headers.append(
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("openai-python"),
+        );
+        headers.insert(
+            HeaderName::from_static("x-route-hint"),
+            HeaderValue::from_static("caller-route"),
+        );
+        let overrides = HeaderOverrides::parse(
+            "capture",
+            &json!({
+                "User-Agent": "codex_cli_rs/0.87.0",
+                "originator": "codex_cli_rs",
+                "x-route-hint": "configured-route"
+            }),
+        )
+        .unwrap();
+        overrides.apply(&mut headers);
+        assert_eq!(headers.get(header::USER_AGENT).unwrap(), "codex_cli_rs/0.87.0");
+        assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(headers.get("x-route-hint").unwrap(), "configured-route");
+        assert_eq!(headers.get_all(header::USER_AGENT).iter().count(), 1);
+        assert_eq!(headers.get_all("originator").iter().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn configured_codex_identity_wins_at_real_outbound_capture() {
+        let (addr, captured) = spawn_header_capture_h2_server().await;
+        let mut state = make_test_app_state_with_headers(
+            &format!("http://{addr}/v1"),
+            false,
+            1,
+            HeaderOverrides::parse(
+                "capture",
+                &json!({
+                    "User-Agent": "codex_cli_rs/0.87.0",
+                    "originator": "codex_cli_rs"
+                }),
+            )
+            .unwrap(),
+        );
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            let slot = Arc::get_mut(&mut state_mut.slots[0]).unwrap();
+            Arc::get_mut(&mut slot.config).unwrap().api_mode = responses::ApiMode::Responses;
+        }
+        let mut request = make_chat_req(false);
+        *request.uri_mut() = "/v1/responses".parse().unwrap();
+        request.headers_mut().insert(
+            header::USER_AGENT,
+            HeaderValue::from_static("python-sdk/2.54.0"),
+        );
+        request.headers_mut().insert(
+            HeaderName::from_static("originator"),
+            HeaderValue::from_static("openai-python"),
+        );
+        let response = handle_chat_completions(State(state), request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        for _ in 0..50 {
+            if !captured.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let headers = captured.lock().unwrap().first().cloned().expect("captured upstream request");
+        assert_eq!(headers.get(header::USER_AGENT).unwrap(), "codex_cli_rs/0.87.0");
+        assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        assert_eq!(headers.get_all(header::USER_AGENT).iter().count(), 1);
+        assert_eq!(headers.get_all("originator").iter().count(), 1);
+    }
+
+    #[test]
+    fn native_auxiliary_operations_use_the_same_override_metadata() {
+        for path in [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/responses/input_tokens",
+        ] {
+            let request = Request::builder()
+                .method(Method::POST)
+                .uri(path)
+                .header(header::USER_AGENT, "python-sdk/2.54.0")
+                .header("originator", "openai-python")
+                .body(Body::empty())
+                .unwrap();
+            let options = responses::RequestOptions::capture(&request);
+            let mut headers = options.headers;
+            HeaderOverrides::parse(
+                "native",
+                &json!({
+                    "User-Agent": "codex_cli_rs/0.87.0",
+                    "originator": "codex_cli_rs"
+                }),
+            )
+            .unwrap()
+            .apply(&mut headers);
+            assert_eq!(headers.get(header::USER_AGENT).unwrap(), "codex_cli_rs/0.87.0");
+            assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+        }
+    }
+
+    #[test]
+    fn config_absent_extra_headers_keeps_existing_header_assembly() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::USER_AGENT, HeaderValue::from_static("souffle_proxy"));
+        HeaderOverrides::default().apply(&mut headers);
+        assert_eq!(headers.get(header::USER_AGENT).unwrap(), "souffle_proxy");
     }
 
     #[test]

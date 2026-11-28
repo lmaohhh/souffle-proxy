@@ -217,6 +217,23 @@ Per-preset in `config.json`:
   `0x010b` (`H3_REQUEST_REJECTED`) retries immediately like `REFUSED_STREAM` from the
   8-retry free budget, `0x010c` (`H3_REQUEST_CANCELLED`) retries with normal exponential
   backoff, and `0x0107` (`H3_EXCESSIVE_LOAD`) backs off 2x like `ENHANCE_YOUR_CALM`.
+- `extra_headers`: optional JSON object mapping HTTP header names to string values. It is
+  parsed once at startup and applied at the shared late outbound replacement point, after
+  built-in headers and native Responses caller headers have been assembled. Matching is
+  case-insensitive; an override replaces all existing values for that name, so it cannot
+  create a duplicate identity header. This is suitable for metadata such as
+  `User-Agent`, `originator`, or custom routing headers. The SOL example uses:
+  `"User-Agent": "codex_cli_rs/0.87.0"` and `"originator": "codex_cli_rs"`.
+  Protected authentication, framing, content-negotiation, hop-by-hop, and proxy-owned
+  no-cache/buffering names are rejected at startup: `host`, `authorization`,
+  `proxy-authorization`, `proxy-authenticate`, `www-authenticate`, `x-api-key`, `api-key`,
+  `cookie`, `set-cookie`, `content-length`, `content-type`, `content-encoding`, `accept`,
+  `accept-encoding`, `connection`, `transfer-encoding`, `keep-alive`, `te`, `trailer`,
+  `upgrade`, `cache-control`, `pragma`, `expires`, `cdn-cache-control`,
+  `cloudflare-cdn-cache-control`, and `x-accel-buffering`. Invalid names/values, pseudo-
+  headers, case-colliding names, non-object values, and non-string values fail startup with
+  preset/field context. Configured values are not included in Debug output. Restart the
+  proxy after changing `config.json`; it does not hot-reload configuration.
 
 ## Runtime Architecture & Memory Optimization
 

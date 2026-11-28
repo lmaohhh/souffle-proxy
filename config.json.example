@@ -43,6 +43,10 @@
       "model": "Souffle-6.1",
       "key_env": "SOUFFLE_API_KEY",
       "upstream_bases": ["https://api.soufflotheque.internal/v1"],
+      "extra_headers": {
+        "User-Agent": "codex_cli_rs/0.87.0",
+        "originator": "codex_cli_rs"
+      },
       "inject": {
         "reasoning": { "effort": "max", "summary": "detailed" }
       }
