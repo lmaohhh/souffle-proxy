@@ -5912,6 +5912,7 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
 
     fn sse_reasoning_delta(payload: &str) -> String {
         format!(
@@ -6481,7 +6482,7 @@ mod tests {
 
     async fn spawn_header_capture_h2_server() -> (
         std::net::SocketAddr,
-        Arc<std::sync::Mutex<Vec<HeaderMap>>>,
+        Arc<std::sync::Mutex<Vec<(String, HeaderMap)>>>,
     ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -6495,7 +6496,15 @@ mod tests {
                         return;
                     };
                     while let Some(Ok((request, mut respond))) = connection.accept().await {
-                        captured.lock().unwrap().push(request.headers().clone());
+                        let path = request
+                            .uri()
+                            .path_and_query()
+                            .map(|path| path.as_str().to_owned())
+                            .unwrap_or_default();
+                        captured
+                            .lock()
+                            .unwrap()
+                            .push((path, request.headers().clone()));
                         let mut body = request.into_body();
                         while let Some(Ok(frame)) = body.data().await {
                             let _ = body.flow_control().release_capacity(frame.len());
@@ -7166,15 +7175,46 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let headers = captured.lock().unwrap().first().cloned().expect("captured upstream request");
+        let (path, headers) = captured
+            .lock()
+            .unwrap()
+            .first()
+            .cloned()
+            .expect("captured upstream request");
+        assert_eq!(path, "/v1/responses");
         assert_eq!(headers.get(header::USER_AGENT).unwrap(), "codex_cli_rs/0.87.0");
         assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
         assert_eq!(headers.get_all(header::USER_AGENT).iter().count(), 1);
         assert_eq!(headers.get_all("originator").iter().count(), 1);
     }
 
-    #[test]
-    fn native_auxiliary_operations_use_the_same_override_metadata() {
+    #[tokio::test]
+    async fn native_auxiliary_operations_use_the_same_override_metadata() {
+        let (addr, captured) = spawn_header_capture_h2_server().await;
+        let mut state = make_test_app_state_with_headers(
+            &format!("http://{addr}/v1"),
+            false,
+            1,
+            HeaderOverrides::parse(
+                "native",
+                &json!({
+                    "User-Agent": "codex_cli_rs/0.87.0",
+                    "originator": "codex_cli_rs"
+                }),
+            )
+            .unwrap(),
+        );
+        {
+            let state_mut = Arc::get_mut(&mut state).unwrap();
+            let slot = Arc::get_mut(&mut state_mut.slots[0]).unwrap();
+            Arc::get_mut(&mut slot.config).unwrap().api_mode = responses::ApiMode::Responses;
+        }
+        let router = build_router(state);
+        let expected = [
+            "/v1/responses",
+            "/v1/responses/compact",
+            "/v1/responses/input_tokens",
+        ];
         for path in [
             "/v1/responses",
             "/v1/responses/compact",
@@ -7185,21 +7225,42 @@ mod tests {
                 .uri(path)
                 .header(header::USER_AGENT, "python-sdk/2.54.0")
                 .header("originator", "openai-python")
-                .body(Body::empty())
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"model":"test-model","input":"hi"}"#))
                 .unwrap();
-            let options = responses::RequestOptions::capture(&request);
-            let mut headers = options.headers;
-            HeaderOverrides::parse(
-                "native",
-                &json!({
-                    "User-Agent": "codex_cli_rs/0.87.0",
-                    "originator": "codex_cli_rs"
-                }),
-            )
-            .unwrap()
-            .apply(&mut headers);
-            assert_eq!(headers.get(header::USER_AGENT).unwrap(), "codex_cli_rs/0.87.0");
-            assert_eq!(headers.get("originator").unwrap(), "codex_cli_rs");
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+        }
+
+        let records = captured.lock().unwrap();
+        assert_eq!(records.len(), expected.len());
+        for ((expected_path, (actual_path, headers)), operation) in
+            expected.iter().zip(records.iter()).zip(["create", "compact", "input_tokens"])
+        {
+            assert_eq!(actual_path, expected_path, "{operation} upstream path");
+            assert_eq!(
+                headers.get(header::USER_AGENT).unwrap(),
+                "codex_cli_rs/0.87.0",
+                "{operation} User-Agent"
+            );
+            assert_eq!(
+                headers.get("originator").unwrap(),
+                "codex_cli_rs",
+                "{operation} originator"
+            );
+            assert_eq!(
+                headers.get_all(header::USER_AGENT).iter().count(),
+                1,
+                "{operation} User-Agent count"
+            );
+            assert_eq!(
+                headers.get_all("originator").iter().count(),
+                1,
+                "{operation} originator count"
+            );
         }
     }
 
