@@ -103,10 +103,12 @@ impl HeaderOverrides {
         Ok(Self { entries })
     }
 
+    #[cfg(test)]
     fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
     }
